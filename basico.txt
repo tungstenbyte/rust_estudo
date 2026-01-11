@@ -1,0 +1,73 @@
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+rustc --version
+cargo --version
+
+cargo new meu_programa
+meu_programa/
+├── Cargo.toml
+└── src
+
+src/main.rs
+
+fn main() {
+    println!("Hello, world!");
+}
+
+
+cargo run
+cargo build
+./target/debug/meu_programa
+
+
+criar binarios: 
+cargo init --bin   
+
+criar libs:
+cargo init --lib
+
+
+
+5️⃣ Criar projeto em uma pasta já existente
+cargo init
+
+6️⃣ Build otimizado (produção)
+cargo build --release
+
+7️⃣ Comparação rápida com Go (pra você que usa Go 😉)
+| Go               | Rust                       |
+| ---------------- | -------------------------- |
+| `go mod init`    | `cargo new` / `cargo init` |
+| `go run main.go` | `cargo run`                |
+| `go build`       | `cargo build`              |
+| binário na raiz  | binário em `target/`       |
+
+🧠 Resumo rápido
+| Situação              | Comando correto          |
+| --------------------- | ------------------------ |
+| Criar pasta + projeto | `cargo new meu_programa` |
+| Pasta já existe       | `cargo init`             |
+| Binário explícito     | `cargo init --bin`       |
+| Biblioteca            | `cargo init --lib`       |
+
+
+✅ Regra de ouro
+
+Sempre abra o VS Code na pasta que contém o Cargo.toml. 
+
+🔧 Dica importante (extensões vscode)
+
+Instale no VS Code:
+
+rust-analyzer (oficial)
+
+(opcional) Even Better TOML
+
+CodeLLDB
+
+Depois de abrir o projeto na raiz, o VS Code detecta automaticamente.
+
+
+
+sudo apt install lldb
+cargo build

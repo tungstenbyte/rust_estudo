@@ -1,0 +1,33 @@
+# ===============================
+# Rust / Cargo (todos os capítulos)
+# ===============================
+**/target/
+**/*.rs.bk
+**/*.pdb
+
+# Cargo.lock:
+# - apps/binários → ignore
+# - libs → versionar
+**/Cargo.lock
+
+# ===============================
+# VS Code
+# ===============================
+.vscode/
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+
+# ===============================
+# Sistema
+# ===============================
+.DS_Store
+Thumbs.db
+
+# ===============================
+# Logs / temporários
+# ===============================
+*.log
+*.tmp
+*.swp
+*.swo
