@@ -1,0 +1,19 @@
+fn main() {
+  let company_string: &str = "TutorialsPoint"; // string type
+  let rating_float: f64 = 4.5; // float type
+  let is_growing_boolean: bool=true; // boolean type
+  let icon_char: char='♥'; //unicode character type
+
+  println!("company name is:{}",company_string);
+  println!("company rating on 5 is:{}",rating_float);
+  println!("company is growing :{}",is_growing_boolean);
+  println!("company icon is:{}",icon_char);
+
+    println!("Exemplo5 -------------");
+    let float_with_separator = 11_000.555_001;
+    println!("float value {}", float_with_separator);
+    let int_with_separator = 50_000;
+    println!("int value {}", int_with_separator);
+
+}
+
