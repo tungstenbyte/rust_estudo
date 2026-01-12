@@ -20,15 +20,28 @@ fn main() {
 }
 fn exemplo1() {
     println!("Exemplo 1: --------------------------------------");
-    let company: &str = "TutorialsPoint";
-    let location: &str = "Hyderabad";
+    let mut company: &str = "TutorialsPoint";
+    let mut location: &str = "Hyderabad";
     println!("company is : {} location :{}", company, location);
+
+    company = "outra company";
+    location = "outra localizacao";
+    println!("company is : {} location :{}", company, location);
+
+
 }
 fn exemplo2() {
     println!("Exemplo 2: --------------------------------------");
-    let company: &'static str = "TutorialsPoint";
-    let location: &'static str = "Hyderabad";
+    let mut company: &'static str = "TutorialsPoint";
+    let mut location: &'static str = "Hyderabad";
     println!("company is : {} location :{}", company, location);
+
+
+    company = "outra company";
+    location = "outra localizacao";
+    println!("company is : {} location :{}", company, location);
+
+
 }
 
 fn exemplo3() {
@@ -71,29 +84,70 @@ fn print_literal(data: &str) {
 
 fn exemplo8() {
     println!("Exemplo 8: --------------------------------------");
+    let mut company = "Tutorial".to_string();
+    company.push('s');
+    println!("{}", company);
 }
 
 fn exemplo9() {
     println!("Exemplo 9: --------------------------------------");
+    let mut company = "Tutorials".to_string();
+    company.push_str(" Point");
+    println!("{}", company);
 }
 fn exemplo10() {
     println!("Exemplo 10: --------------------------------------");
+    let fullname = " Tutorials Point";
+    println!("length is {}", fullname.len());
 }
 
 fn exemplo11() {
     println!("Exemplo 11: --------------------------------------");
+    let fullname = " Tutorials Point \r\n";
+    println!("Before trim ");
+    println!("length is {}", fullname.len());
+    println!();
+    println!("After trim ");
+    println!("length is {}", fullname.trim().len());
 }
 fn exemplo12() {
     println!("Exemplo 12: --------------------------------------");
+    let msg = "Tutorials Point has good tutorials".to_string();
+    let mut i = 1;
+    for token in msg.split_whitespace() {
+        println!("token {} {}", i, token);
+        i += 1;
+    }
 }
 
 fn exemplo13() {
     println!("Exemplo 13: --------------------------------------");
+
+    let fullname = "Kannan,Sudhakaran,Tutorialspoint";
+
+    for token in fullname.split(",") {
+        println!("token is {}", token);
+    }
+
+    //store in a Vector
+    println!("\n");
+    let tokens: Vec<&str> = fullname.split(",").collect();
+    println!("firstName is {}", tokens[0]);
+    println!("lastname is {}", tokens[1]);
+    println!("company is {}", tokens[2]);
 }
 fn exemplo14() {
     println!("Exemplo 14: --------------------------------------");
+    let number = 2020;
+    let number_as_string = number.to_string(); // convert number to string
+    println!("{}", number_as_string);
+    println!("{}", number_as_string == "2020");
 }
 
 fn exemplo15() {
     println!("Exemplo 15: --------------------------------------");
+    let n1 = "Tutorials".to_string();
+    let n2 = "Point".to_string();
+    let n3 = format!("{} {}", n1, n2);
+    println!("{}", n3);
 }
