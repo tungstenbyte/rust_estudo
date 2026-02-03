@@ -30,9 +30,13 @@ fn mutate_no_to_zero(mut param_no: i32) {
     param_no = param_no * 0;
     println!("param_no value is :{}", param_no);
 }
-
+fn display(param_name: String) {
+    println!("param_name value is :{}", param_name);
+}
 fn exemplo3() {
     println!("3 -----------------------------");
+    let name: String = String::from("TutorialsPoint");
+    display(name); //cannot access name after display    
 }
 fn exemplo4() {
     println!("4 -----------------------------");

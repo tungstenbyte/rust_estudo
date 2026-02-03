@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  pulsar:
+    image: apachepulsar/pulsar:latest
+    container_name: pulsar
+    ports:
+      - "6650:6650"  # Pulsar binary protocol
+      - "8080:8080"  # Pulsar HTTP/Admin API
+    command: bin/pulsar standalone
+    environment:
+      - PULSAR_MEM=-Xms512m -Xmx512m -XX:MaxDirectMemorySize=256m
+    volumes:
+      - pulsar-data:/pulsar/data
+      - pulsar-conf:/pulsar/conf
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/admin/v2/brokers/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Interface gráfica web para administrar o Pulsar
+  pulsar-manager:
+    image: apachepulsar/pulsar-manager:latest
+    container_name: pulsar-manager
+    ports:
+      - "9527:9527"  # Front-end (acesse http://localhost:9527)
+      - "7750:7750"  # Back-end API
+    environment:
+      - SPRING_CONFIGURATION_FILE=/pulsar-manager/pulsar-manager/application.properties
+    depends_on:
+      pulsar:
+        condition: service_healthy
+
+volumes:
+  pulsar-data:
+  pulsar-conf:

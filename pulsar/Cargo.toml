@@ -1,0 +1,22 @@
+[package]
+name = "pulsar-rust-example"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "producer_parallel"
+path = "src/bin/producer_parallel.rs"
+
+[[bin]]
+name = "consumer_workers"
+path = "src/bin/consumer_workers.rs"
+
+[dependencies]
+pulsar = "5.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
