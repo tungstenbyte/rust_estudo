@@ -1,0 +1,38 @@
+# <---- adicionado aqui: Configuração do Prometheus para coletar métricas
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  # Scrape do próprio Prometheus
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # <---- adicionado aqui: Scrape da aplicação Go
+  - job_name: 'novo-exemplo-palm-pay'
+    static_configs:
+      - targets: ['host.docker.internal:2112']  # Para Docker Desktop
+        # - targets: ['172.17.0.1:2112']        # Para Docker Linux
+    scrape_interval: 10s
+    metrics_path: /metrics
+    honor_labels: true
+    params:
+      format: ['prometheus']
+
+  # <---- adicionado aqui: Health check endpoint
+  - job_name: 'novo-exemplo-palm-pay-health'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+    metrics_path: /health
+    scrape_interval: 30s

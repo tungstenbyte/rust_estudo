@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata: 
+  name: "novo-exemplo-palm-pay-service"
+spec:
+  selector:
+    app: "novo-exemplo-palm-pay"
+  type: LoadBalancer
+  ports:
+  - protocol: TCP
+    port: 8004
+    targetPort: 8004
+    nodePort: 30034
+    name: novo-exemplo-palm-pay-server-port
+

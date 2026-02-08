@@ -1,0 +1,121 @@
+# <---- adicionado aqui: Regras de alerta para observabilidade
+
+groups:
+  - name: novo-exemplo-palm-pay.alerts
+    rules:
+      # <---- adicionado aqui: Alertas de HTTP
+      - alert: HighErrorRate
+        expr: rate(http_errors_total[5m]) / rate(http_requests_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Taxa de erro HTTP alta"
+          description: "Taxa de erro HTTP está acima de 10% por mais de 2 minutos. Valor atual: {{ $value }}%"
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Latência HTTP alta"
+          description: "P95 da latência HTTP está acima de 1s. Valor atual: {{ $value }}s"
+
+      # <---- adicionado aqui: Alertas de Performance
+      - alert: SlowOperations
+        expr: rate(slow_operations_total[5m]) > 0.1
+        for: 1m
+        labels:
+          severity: warning
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Operações lentas detectadas"
+          description: "Operações lentas detectadas na camada {{ $labels.layer }}. Taxa: {{ $value }} ops/s"
+
+      - alert: TimeoutOperations
+        expr: rate(timeout_operations_total[5m]) > 0.01
+        for: 1m
+        labels:
+          severity: critical
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Timeouts detectados"
+          description: "Timeouts detectados em {{ $labels.operation }}. Taxa: {{ $value }} timeouts/s"
+
+      # <---- adicionado aqui: Alertas de Banco de Dados
+      - alert: DatabaseQueryErrors
+        expr: rate(db_query_errors_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Erros de query no banco"
+          description: "Taxa de erros de query alta na tabela {{ $labels.table }}. Taxa: {{ $value }} erros/s"
+
+      - alert: DatabaseSlowQueries
+        expr: histogram_quantile(0.95, rate(db_query_duration_seconds_bucket[5m])) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Queries lentas no banco"
+          description: "P95 das queries está acima de 500ms na tabela {{ $labels.table }}. Valor: {{ $value }}s"
+
+      # <---- adicionado aqui: Alertas de Sistema
+      - alert: HighMemoryUsage
+        expr: memory_usage_bytes > 1000000000  # 1GB
+        for: 5m
+        labels:
+          severity: warning
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Uso de memória alto"
+          description: "Uso de memória está acima de 1GB. Valor atual: {{ $value | humanize }}B"
+
+      - alert: HighGoroutineCount
+        expr: goroutines_active > 1000
+        for: 5m
+        labels:
+          severity: warning
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Muitas goroutines ativas"
+          description: "Número de goroutines está acima de 1000. Valor atual: {{ $value }}"
+
+      # <---- adicionado aqui: Alertas de Validação
+      - alert: HighValidationErrors
+        expr: rate(handler_validation_errors_total[5m]) > 0.2
+        for: 2m
+        labels:
+          severity: warning
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Taxa alta de erros de validação"
+          description: "Taxa de erros de validação alta no campo {{ $labels.field }}. Taxa: {{ $value }} erros/s"
+
+      # <---- adicionado aqui: Alert de Health Check
+      - alert: ServiceDown
+        expr: up{job="novo-exemplo-palm-pay"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Serviço fora do ar"
+          description: "O serviço novo-exemplo-palm-pay não está respondendo por mais de 1 minuto"
+
+      # <---- adicionado aqui: Alert de ausência de métricas
+      - alert: NoMetrics
+        expr: absent(http_requests_total{job="novo-exemplo-palm-pay"})
+        for: 2m
+        labels:
+          severity: critical
+          service: novo-exemplo-palm-pay
+        annotations:
+          summary: "Métricas não estão sendo coletadas"
+          description: "Nenhuma métrica HTTP está sendo coletada do serviço por mais de 2 minutos"

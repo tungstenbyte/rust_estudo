@@ -1,0 +1,71 @@
+{
+  "id": null,
+  "title": "Performance Analysis - Análise de Performance",
+  "tags": ["performance", "slow", "optimization"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "P95 por Camada (ms)",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(handler_duration_seconds_bucket{usecase=\"meuexemplo\"}[5m])) * 1000",
+          "legendFormat": "Handler P95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(service_duration_seconds_bucket{usecase=\"meuexemplo\"}[5m])) * 1000",
+          "legendFormat": "Service P95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(repository_duration_seconds_bucket{usecase=\"meuexemplo\"}[5m])) * 1000",
+          "legendFormat": "Repository P95",
+          "refId": "C"
+        }
+      ],
+      "yAxes": [
+        {
+          "label": "Latency (ms)",
+          "min": 0
+        }
+      ],
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "title": "Tempo Médio por Camada (ms)",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "rate(handler_duration_seconds_sum{usecase=\"meuexemplo\"}[5m]) / rate(handler_duration_seconds_count{usecase=\"meuexemplo\"}[5m]) * 1000",
+          "legendFormat": "Handler Avg",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(service_duration_seconds_sum{usecase=\"meuexemplo\"}[5m]) / rate(service_duration_seconds_count{usecase=\"meuexemplo\"}[5m]) * 1000",
+          "legendFormat": "Service Avg",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(repository_duration_seconds_sum{usecase=\"meuexemplo\"}[5m]) / rate(repository_duration_seconds_count{usecase=\"meuexemplo\"}[5m]) * 1000",
+          "legendFormat": "Repository Avg",
+          "refId": "C"
+        }
+      ],
+      "yAxes": [
+        {
+          "label": "Latency (ms)",
+          "min": 0
+        }
+      ],
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 10}
+    }
+  ]
+}

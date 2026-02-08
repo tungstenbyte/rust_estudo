@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'novo-exemplo-palm-pay'
+    static_configs:
+      - targets: ['192.168.86.237:2112']
+    metrics_path: '/metrics'
+    scrape_interval: 5s

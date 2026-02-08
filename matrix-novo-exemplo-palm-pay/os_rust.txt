@@ -1,0 +1,3209 @@
+---------------------------------------------
+./server/app.rs
+use axum::{
+    extract::Request,
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{Json, Response},
+    routing::get,
+    Router,
+};
+use serde_json::{json, Value};
+use sqlx::{PgPool, Pool, Postgres};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::signal;
+use tower::ServiceBuilder;
+use tower_http::timeout::TimeoutLayer;
+
+use crate::handler::register_meuexemplo_http_endpoints;
+use crate::repository::MeuexemploRepository;
+use crate::service::{MeuexemploServiceIF, Resource};
+
+pub trait Logger: Send + Sync {
+    fn info(&self, message: &str);
+    fn init_logger(&self, level: &str);
+}
+
+pub struct App {
+    http_server: Option<axum::serve::Serve<Router, Router>>,
+    pgdb_write: Option<Arc<PgPool>>,
+    pgdb_read: Option<Arc<PgPool>>,
+    log: Option<Arc<dyn Logger>>,
+    meuexemplo_sv: Option<Arc<dyn MeuexemploServiceIF>>,
+}
+
+pub trait ServerIF {
+    async fn start(&mut self);
+    async fn stop(&mut self);
+    async fn run(&mut self, port: &str) -> Result<(), anyhow::Error>;
+}
+
+impl App {
+    pub fn new() -> impl ServerIF {
+        App {
+            http_server: None,
+            pgdb_write: None,
+            pgdb_read: None,
+            log: None,
+            meuexemplo_sv: None,
+        }
+    }
+}
+
+impl ServerIF for App {
+    async fn start(&mut self) {
+        let log = create_logger();
+        log.init_logger("Dpanic");
+        self.log = Some(Arc::new(log));
+
+        // Inicializar observabilidade
+        if let Err(e) = init_observability("novo-exemplo-palm-pay", "1.0.0").await {
+            panic!("Erro ao inicializar observabilidade: {}", e);
+        }
+
+        // Iniciar servidor de métricas
+        tokio::spawn(start_metrics_server("2112"));
+
+        self.start_pg_write().await;
+        self.start_pg_read().await;
+
+        let meuexemplo_repository = MeuexemploRepository::new(
+            self.pgdb_write.as_ref().unwrap().clone(),
+            self.pgdb_read.as_ref().unwrap().clone(),
+            Box::new(DefaultLogger),
+        );
+
+        self.meuexemplo_sv = Some(Arc::new(Resource::new(
+            Arc::new(meuexemplo_repository),
+            Box::new(DefaultLogger),
+        )));
+    }
+
+    async fn run(&mut self, port: &str) -> Result<(), anyhow::Error> {
+        let mut router = Router::new();
+
+        // Middlewares
+        router = router
+            .layer(ServiceBuilder::new()
+                .layer(request_id_middleware())
+                .layer(TimeoutLayer::new(Duration::from_secs(30)))
+                .layer(middleware::from_fn(structured_logging_middleware))
+                .layer(middleware::from_fn(enhanced_http_metrics_middleware))
+            );
+
+        // Health check endpoint
+        router = router.route("/health", get(health_check_handler));
+
+        // Metrics endpoint
+        router = router.route("/internal/metrics", get(metrics_handler));
+
+        // API routes
+        let api_routes = register_meuexemplo_http_endpoints(
+            self.meuexemplo_sv.as_ref().unwrap().clone(),
+            self.log.as_ref().unwrap().clone(),
+        );
+
+        router = router.nest("/api", api_routes);
+
+        let addr = format!("0.0.0.0:{}", port);
+        println!("≡ Microservices novo-exemplo-palm-pay Started in local Port: {} ≡", port);
+        println!("📊 Métricas disponíveis em: http://localhost:2112/metrics");
+        println!("🔍 Health check em: http://localhost:{}/health", port);
+        println!("");
+
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+
+        Ok(())
+    }
+
+    async fn stop(&mut self) {
+        self.stop_pg_read();
+        self.stop_pg_write();
+        self.stop_http();
+        if let Some(log) = &self.log {
+            log.info("Finalizado com sucesso");
+        }
+    }
+}
+
+impl App {
+    async fn start_pg_write(&mut self) {
+        let url = std::env::var("POSTGRESQL_WRITE_URL").expect("POSTGRESQL_WRITE_URL not set");
+
+        let pool = PgPool::connect(&url).await.expect("Failed to connect to PostgreSQL Write");
+
+        // Configurar pool
+        // Note: sqlx não tem configuração equivalente direta, mas pode ser configurado via URL
+
+        if pool.acquire().await.is_err() {
+            panic!("Failed to ping PostgreSQL Write");
+        }
+
+        // Registrar métricas de conexão
+        update_db_connections("meuexemplo", 30).await;
+
+        self.pgdb_write = Some(Arc::new(pool));
+        if let Some(log) = &self.log {
+            log.info("DB Postgresql Writer was connected...");
+        }
+    }
+
+    async fn start_pg_read(&mut self) {
+        let url = std::env::var("POSTGRESQL_READ_URL").expect("POSTGRESQL_READ_URL not set");
+
+        let pool = PgPool::connect(&url).await.expect("Failed to connect to PostgreSQL Read");
+
+        if pool.acquire().await.is_err() {
+            panic!("Failed to ping PostgreSQL Read");
+        }
+
+        update_db_connections("meuexemplo", 30).await;
+
+        self.pgdb_read = Some(Arc::new(pool));
+        if let Some(log) = &self.log {
+            log.info("DB Postgresql Read was connected...");
+        }
+    }
+
+    fn stop_pg_write(&mut self) {
+        if let Some(pool) = self.pgdb_write.take() {
+            // PgPool fecha automaticamente quando sai de escopo
+            if let Some(log) = &self.log {
+                log.info("PG Write conexao finalizada ok");
+            }
+        }
+    }
+
+    fn stop_pg_read(&mut self) {
+        if let Some(pool) = self.pgdb_read.take() {
+            // PgPool fecha automaticamente quando sai de escopo
+            if let Some(log) = &self.log {
+                log.info("PG Read conexao finalizada ok");
+            }
+        }
+    }
+
+    fn stop_http(&mut self) {
+        // Axum server para automaticamente com graceful shutdown
+        if let Some(log) = &self.log {
+            log.info("Http conexao finalizada ok");
+        }
+    }
+}
+
+// Middleware functions
+fn request_id_middleware() -> axum::middleware::FromFn<impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, StatusCode>> + Send>>> {
+    middleware::from_fn(|req, next| {
+        Box::pin(async move {
+            // Implementar request ID middleware
+            next.run(req).await
+        })
+    })
+}
+
+async fn structured_logging_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
+    // Implementar structured logging
+    next.run(req).await
+}
+
+async fn enhanced_http_metrics_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
+    // Implementar HTTP metrics
+    next.run(req).await
+}
+
+// Handlers
+async fn health_check_handler() -> Result<Json<Value>, StatusCode> {
+    let start = std::time::Instant::now();
+
+    // Verificar conexões do banco seria feito aqui
+    let health = json!({
+        "status": "healthy",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "version": "1.0.0",
+        "service": "novo-exemplo-palm-pay",
+        "pg_write": "ok",
+        "pg_read": "ok",
+        "response_time_ms": start.elapsed().as_millis()
+    });
+
+    Ok(Json(health))
+}
+
+async fn metrics_handler() -> Json<Value> {
+    Json(json!({
+        "metrics_endpoint": "http://localhost:2112/metrics",
+        "prometheus_format": true,
+        "service": "novo-exemplo-palm-pay"
+    }))
+}
+
+// Utility functions
+async fn init_observability(service: &str, version: &str) -> Result<(), anyhow::Error> {
+    // Implementar inicialização de observabilidade
+    Ok(())
+}
+
+async fn start_metrics_server(port: &str) {
+    // Implementar servidor de métricas
+}
+
+async fn update_db_connections(service: &str, connections: i32) {
+    // Implementar update de métricas de conexão
+}
+
+fn create_logger() -> impl Logger {
+    DefaultLogger
+}
+
+struct DefaultLogger;
+
+impl Logger for DefaultLogger {
+    fn info(&self, message: &str) {
+        println!("{}", message);
+    }
+
+    fn init_logger(&self, _level: &str) {
+        // Implementar inicialização de logger
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}---------------------------------------------
+./model/itemspage.rs
+// Equivalente ao model.ItemsPage
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ItemsPage<T> {
+    pub offset: i64,
+    pub limit: i64,
+    pub total: i64,
+    pub items: T,
+}---------------------------------------------
+./model/meuexemplo.rs
+// Equivalente ao model.Meuexemplo
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Meuexemplo {
+    pub id: i64,
+    pub status_code: String,
+    pub name: String,
+    pub description: String,
+    pub allows_transactions: bool,
+    pub max_transaction_amount: Decimal,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(skip)]
+    #[sqlx(rename = "meuexemplo_category_full_count")]
+    pub full_count: i64,
+}---------------------------------------------
+./config/init.rs
+use dotenv::dotenv;
+use std::process;
+
+pub fn init() {
+    if let Err(err) = dotenv() {
+        eprintln!("Erro lendo as variaveis de ambiente: {}", err);
+        process::exit(1);
+    }
+}---------------------------------------------
+./app/constantes.rs
+pub const MESSAGE: &str = "message";
+pub const MSG_SUCCESS: &str = "Success";
+pub const MSG_FAIL: &str = "Fail";
+pub const MSG_BAD_REQUEST: &str = "Bad Request";
+pub const MSG_EMPTY: &str = "Not Found";
+pub const MSG_INTERNAL_ERROR: &str = "Internal Error";
+pub const MSG_INVALID: &str = "Id invalid";
+pub const MSG_REPOSITORY_ERROR: &str = "Repository Error";
+pub const MSG_OFFSET_LIMIT: &str = "Inform the params limit and offset correctly";
+pub const MSG_HEALTH: &str = "Ok";---------------------------------------------
+./app/meuexemplo/service/meuexemplo.rs
+use async_trait::async_trait;
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::{error, info};
+
+// Imports dos módulos (assumindo que existem)
+use crate::model::{ItemsPage, Meuexemplo};
+use crate::repository::MeuexemploRepositoryIF;
+
+// Constantes de mensagens de erro (equivalente ao app.MsgRepositoryError)
+pub mod app {
+    pub const MSG_REPOSITORY_ERROR: &str = "Repository error occurred";
+}
+
+// Sistema de observabilidade para Service
+pub struct ServiceTracker {
+    operation: String,
+    started_at: Instant,
+    params: std::collections::HashMap<String, String>,
+    results: std::collections::HashMap<String, String>,
+}
+
+impl ServiceTracker {
+    pub fn new(operation: &str) -> Self {
+        Self {
+            operation: operation.to_string(),
+            started_at: Instant::now(),
+            params: std::collections::HashMap::new(),
+            results: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn add_param<T: ToString>(&mut self, key: &str, value: T) {
+        self.params.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn add_result<T: ToString>(&mut self, key: &str, value: T) {
+        self.results.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn finish(self, error: Option<&anyhow::Error>) {
+        let duration = self.started_at.elapsed();
+        
+        if let Some(err) = error {
+            error!(
+                operation = %self.operation,
+                duration_ms = duration.as_millis(),
+                error = %err,
+                params = ?self.params,
+                "Service operation failed"
+            );
+        } else {
+            info!(
+                operation = %self.operation,
+                duration_ms = duration.as_millis(),
+                params = ?self.params,
+                results = ?self.results,
+                "Service operation completed"
+            );
+        }
+    }
+}
+
+pub struct ServiceObservability {
+    service_name: String,
+}
+
+impl ServiceObservability {
+    pub fn new(service_name: &str) -> Self {
+        Self {
+            service_name: service_name.to_string(),
+        }
+    }
+
+    pub fn track(&self, operation: &str) -> ServiceTracker {
+        ServiceTracker::new(operation)
+    }
+}
+
+// Logger trait para manter compatibilidade
+pub trait Logger {
+    fn chronometer(&self, method: &str, started_at: &Instant);
+}
+
+pub struct DefaultLogger;
+
+impl Logger for DefaultLogger {
+    fn chronometer(&self, method: &str, started_at: &Instant) {
+        let duration = started_at.elapsed();
+        info!(
+            method = method,
+            duration_ms = duration.as_millis(),
+            "Service method completed"
+        );
+    }
+}
+
+// Trait equivalente à interface Go
+#[async_trait]
+pub trait MeuexemploServiceIF {
+    async fn get_meuexemplo(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<ItemsPage<Vec<Meuexemplo>>, anyhow::Error>;
+    
+    async fn get_meuexemplo_by_id(&self, id: i64) -> Result<Option<Meuexemplo>, anyhow::Error>;
+    
+    async fn get_meuexemplo_by_status_code(
+        &self,
+        status_code: &str,
+    ) -> Result<Option<Meuexemplo>, anyhow::Error>;
+    
+    async fn insert_meuexemplo(&self, meuexemplo: &Meuexemplo) -> Result<i64, anyhow::Error>;
+    
+    async fn update_meuexemplo(
+        &self,
+        meuexemplo: &Meuexemplo,
+        id: i64,
+    ) -> Result<(), anyhow::Error>;
+    
+    async fn delete_meuexemplo_by_id(&self, id: i64) -> Result<bool, anyhow::Error>;
+}
+
+// Struct Resource (equivalente ao Resource do Go)
+pub struct Resource {
+    meuexemplo_repo: Arc<dyn MeuexemploRepositoryIF + Send + Sync>,
+    log: Box<dyn Logger + Send + Sync>,
+    observability: ServiceObservability,
+}
+
+impl Resource {
+    pub fn new(
+        meuexemplo_repo: Arc<dyn MeuexemploRepositoryIF + Send + Sync>,
+        log: Box<dyn Logger + Send + Sync>,
+    ) -> Self {
+        Self {
+            meuexemplo_repo,
+            log,
+            observability: ServiceObservability::new("service.meuexemplo"),
+        }
+    }
+}
+
+#[async_trait]
+impl MeuexemploServiceIF for Resource {
+    async fn get_meuexemplo(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<ItemsPage<Vec<Meuexemplo>>, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track("service.GetMeuexemplo.get_list");
+        
+        tracker.add_param("service.GetMeuexemplo.offset", offset);
+        tracker.add_param("service.GetMeuexemplo.limit", limit);
+
+        let result = async {
+            let items_page = self.meuexemplo_repo.get_meuexemplo(offset, limit).await;
+            
+            let items_page = match items_page {
+                Ok(items_page) => items_page,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(app::MSG_REPOSITORY_ERROR));
+                }
+            };
+
+            // Adicionar resultado
+            tracker.add_result("service.GetMeuexemplo.count", items_page.items.len());
+            tracker.add_result("service.GetMeuexemplo.total", items_page.total);
+
+            Ok::<ItemsPage<Vec<Meuexemplo>>, anyhow::Error>(items_page)
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploService -> GetMeuexemplo", &started_at);
+        result
+    }
+
+    async fn get_meuexemplo_by_id(&self, id: i64) -> Result<Option<Meuexemplo>, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track("service.GetMeuexemploById");
+        
+        tracker.add_param("service.GetMeuexemploById.id", id);
+
+        let result = async {
+            let meuexemplo = self.meuexemplo_repo.get_meuexemplo_by_id(id).await;
+            
+            let meuexemplo = match meuexemplo {
+                Ok(meuexemplo) => meuexemplo,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(app::MSG_REPOSITORY_ERROR));
+                }
+            };
+
+            tracker.add_result("service.GetMeuexemploById.found", meuexemplo.is_some());
+            Ok::<Option<Meuexemplo>, anyhow::Error>(meuexemplo)
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploService -> GetMeuexemploById", &started_at);
+        result
+    }
+
+    async fn get_meuexemplo_by_status_code(
+        &self,
+        status_code: &str,
+    ) -> Result<Option<Meuexemplo>, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track("service.GetMeuexemploByStatusCode");
+        
+        tracker.add_param("service.GetMeuexemploByStatusCode.status_code", status_code);
+
+        let result = async {
+            let meuexemplo = self.meuexemplo_repo.get_meuexemplo_by_status_code(status_code).await;
+            
+            let meuexemplo = match meuexemplo {
+                Ok(meuexemplo) => meuexemplo,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(app::MSG_REPOSITORY_ERROR));
+                }
+            };
+
+            tracker.add_result("service.GetMeuexemploByStatusCode.found", meuexemplo.is_some());
+            Ok::<Option<Meuexemplo>, anyhow::Error>(meuexemplo)
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploService -> GetMeuexemploByStatusCode", &started_at);
+        result
+    }
+
+    async fn delete_meuexemplo_by_id(&self, id: i64) -> Result<bool, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track("service.DeleteMeuexemploById.delete");
+        
+        tracker.add_param("service.DeleteMeuexemploById.id", id);
+
+        let result = async {
+            let result = self.meuexemplo_repo.delete_meuexemplo_by_id(id).await;
+            
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(app::MSG_REPOSITORY_ERROR));
+                }
+            };
+
+            tracker.add_result("service.DeleteMeuexemploById.deleted", result);
+            Ok::<bool, anyhow::Error>(result)
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploService -> DeleteMeuexemploById", &started_at);
+        result
+    }
+
+    async fn insert_meuexemplo(&self, meuexemplo: &Meuexemplo) -> Result<i64, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track("service.InsertMeuexemplo");
+        
+        tracker.add_param("service.InsertMeuexemplo.name", &meuexemplo.name);
+        tracker.add_param("service.InsertMeuexemplo.status_code", &meuexemplo.status_code);
+
+        let result = async {
+            let inserted_id = self.meuexemplo_repo.insert_meuexemplo(meuexemplo).await;
+            
+            let inserted_id = match inserted_id {
+                Ok(inserted_id) => inserted_id,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(app::MSG_REPOSITORY_ERROR));
+                }
+            };
+
+            tracker.add_result("service.InsertMeuexemplo.inserted_id", inserted_id);
+            Ok::<i64, anyhow::Error>(inserted_id)
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploService -> InsertMeuexemplo", &started_at);
+        result
+    }
+
+    async fn update_meuexemplo(
+        &self,
+        meuexemplo: &Meuexemplo,
+        id: i64,
+    ) -> Result<(), anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track("service.UpdateMeuexemplo");
+        
+        tracker.add_param("service.UpdateMeuexemplo.id", id);
+        tracker.add_param("service.UpdateMeuexemplo.name", &meuexemplo.name);
+        tracker.add_param("service.UpdateMeuexemplo.status_code", &meuexemplo.status_code);
+
+        let result = async {
+            let result = self.meuexemplo_repo.update_meuexemplo(meuexemplo, id).await;
+            
+            match result {
+                Ok(()) => {
+                    tracker.add_result("service.UpdateMeuexemplo.updated", true);
+                    Ok::<(), anyhow::Error>(())
+                }
+                Err(_) => {
+                    Err(anyhow::anyhow!(app::MSG_REPOSITORY_ERROR))
+                }
+            }
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploService -> UpdateMeuexemplo", &started_at);
+        result
+    }
+}
+
+// Exemplo de uso e testes
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    // Mock do Repository para testes
+    struct MockRepository;
+
+    #[async_trait]
+    impl MeuexemploRepositoryIF for MockRepository {
+        async fn get_meuexemplo(
+            &self,
+            _offset: i64,
+            _limit: i64,
+        ) -> Result<ItemsPage<Vec<Meuexemplo>>, anyhow::Error> {
+            Ok(ItemsPage {
+                offset: 0,
+                limit: 10,
+                total: 1,
+                items: vec![Meuexemplo {
+                    id: 1,
+                    status_code: "ACTIVE".to_string(),
+                    name: "Test".to_string(),
+                    description: "Test description".to_string(),
+                    allows_transactions: true,
+                    max_transaction_amount: Decimal::from_str("1000.0").unwrap(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    full_count: 1,
+                }],
+            })
+        }
+
+        async fn get_meuexemplo_by_id(&self, _id: i64) -> Result<Option<Meuexemplo>, anyhow::Error> {
+            Ok(Some(Meuexemplo {
+                id: 1,
+                status_code: "ACTIVE".to_string(),
+                name: "Test".to_string(),
+                description: "Test description".to_string(),
+                allows_transactions: true,
+                max_transaction_amount: Decimal::from_str("1000.0").unwrap(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                full_count: 1,
+            }))
+        }
+
+        async fn get_meuexemplo_by_status_code(
+            &self,
+            _status_code: &str,
+        ) -> Result<Option<Meuexemplo>, anyhow::Error> {
+            Ok(Some(Meuexemplo {
+                id: 1,
+                status_code: "ACTIVE".to_string(),
+                name: "Test".to_string(),
+                description: "Test description".to_string(),
+                allows_transactions: true,
+                max_transaction_amount: Decimal::from_str("1000.0").unwrap(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                full_count: 1,
+            }))
+        }
+
+        async fn insert_meuexemplo(&self, _meuexemplo: &Meuexemplo) -> Result<i64, anyhow::Error> {
+            Ok(1)
+        }
+
+        async fn update_meuexemplo(
+            &self,
+            _meuexemplo: &Meuexemplo,
+            _id: i64,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        async fn delete_meuexemplo_by_id(&self, _id: i64) -> Result<bool, anyhow::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_service_operations() {
+        let repo = Arc::new(MockRepository);
+        let logger = Box::new(DefaultLogger);
+        let service = Resource::new(repo, logger);
+
+        // Test get list
+        let result = service.get_meuexemplo(0, 10).await;
+        assert!(result.is_ok());
+
+        // Test get by id
+        let result = service.get_meuexemplo_by_id(1).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+
+        // Test get by status code
+        let result = service.get_meuexemplo_by_status_code("ACTIVE").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+
+        // Test insert
+        let meuexemplo = Meuexemplo {
+            id: 0,
+            status_code: "ACTIVE".to_string(),
+            name: "Test".to_string(),
+            description: "Test description".to_string(),
+            allows_transactions: true,
+            max_transaction_amount: Decimal::from_str("1000.0").unwrap(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            full_count: 0,
+        };
+
+        let result = service.insert_meuexemplo(&meuexemplo).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 1);
+
+        // Test update
+        let result = service.update_meuexemplo(&meuexemplo, 1).await;
+        assert!(result.is_ok());
+
+        // Test delete
+        let result = service.delete_meuexemplo_by_id(1).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+}---------------------------------------------
+./app/meuexemplo/repository/ddl.rs
+// SQL queries - equivalente às constantes Go
+const SQL_MEUEXEMPLO_LIST: &str = r#"
+    SELECT
+        id,
+        status_code,
+        name,
+        description,
+        allows_transactions,
+        max_transaction_amount,
+        created_at,
+        updated_at
+    FROM meuexemplo
+    ORDER BY id LIMIT $1 OFFSET $2
+"#;
+
+const SQL_MEUEXEMPLO_INSERT: &str = r#"
+    INSERT INTO meuexemplo(
+        status_code,
+        name,
+        description,
+        allows_transactions,
+        max_transaction_amount,
+        created_at,
+        updated_at)
+    VALUES(
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        $7) RETURNING id
+"#;
+
+const SQL_MEUEXEMPLO_UPDATE: &str = r#"
+    UPDATE meuexemplo SET
+        status_code = $1,
+        name = $2,
+        description = $3,
+        allows_transactions = $4,
+        max_transaction_amount = $5,
+        created_at = $6,
+        updated_at = $7
+    WHERE id = $8
+"#;
+
+const SQL_MEUEXEMPLO_DELETE_BY_ID: &str = r#"
+    DELETE FROM meuexemplo
+    WHERE id = $1
+"#;
+
+const SQL_GET_MEUEXEMPLO_BY_ID: &str = r#"
+    SELECT
+        id,
+        status_code,
+        name,
+        description,
+        allows_transactions,
+        max_transaction_amount,
+        created_at,
+        updated_at
+    FROM meuexemplo
+    WHERE id = $1
+"#;
+
+const SQL_GET_MEUEXEMPLO_BY_STATUS_CODE: &str = r#"
+    SELECT
+        id,
+        status_code,
+        name,
+        description,
+        allows_transactions,
+        max_transaction_amount,
+        created_at,
+        updated_at
+    FROM meuexemplo
+    WHERE status_code LIKE '%' || $1 || '%'
+"#;---------------------------------------------
+./app/meuexemplo/repository/meuexemplo.rs
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::{error, info};
+use rust_decimal::Decimal;
+
+
+
+// Sistema de observabilidade
+pub struct QueryTracker {
+    operation: String,
+    method: String,
+    started_at: Instant,
+    params: std::collections::HashMap<String, String>,
+    results: std::collections::HashMap<String, String>,
+}
+
+impl QueryTracker {
+    pub fn new(operation: &str, method: &str) -> Self {
+        Self {
+            operation: operation.to_string(),
+            method: method.to_string(),
+            started_at: Instant::now(),
+            params: std::collections::HashMap::new(),
+            results: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn add_param<T: ToString>(&mut self, key: &str, value: T) {
+        self.params.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn add_result<T: ToString>(&mut self, key: &str, value: T) {
+        self.results.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn finish(self, error: Option<&anyhow::Error>) {
+        let duration = self.started_at.elapsed();
+        
+        if let Some(err) = error {
+            error!(
+                operation = %self.operation,
+                method = %self.method,
+                duration_ms = duration.as_millis(),
+                error = %err,
+                params = ?self.params,
+                "Database operation failed"
+            );
+        } else {
+            info!(
+                operation = %self.operation,
+                method = %self.method,
+                duration_ms = duration.as_millis(),
+                params = ?self.params,
+                results = ?self.results,
+                "Database operation completed"
+            );
+        }
+    }
+}
+
+pub struct RepositoryObservability {
+    service_name: String,
+}
+
+impl RepositoryObservability {
+    pub fn new(service_name: &str) -> Self {
+        Self {
+            service_name: service_name.to_string(),
+        }
+    }
+
+    pub fn track_query(&self, operation: &str, method: &str) -> QueryTracker {
+        QueryTracker::new(operation, method)
+    }
+}
+
+// Trait equivalente à interface Go
+#[async_trait]
+pub trait MeuexemploRepositoryIF {
+    async fn get_meuexemplo(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<ItemsPage<Vec<Meuexemplo>>, anyhow::Error>;
+    
+    async fn get_meuexemplo_by_id(&self, id: i64) -> Result<Option<Meuexemplo>, anyhow::Error>;
+    
+    async fn get_meuexemplo_by_status_code(
+        &self,
+        status_code: &str,
+    ) -> Result<Option<Meuexemplo>, anyhow::Error>;
+    
+    async fn insert_meuexemplo(&self, meuexemplo: &Meuexemplo) -> Result<i64, anyhow::Error>;
+    
+    async fn update_meuexemplo(
+        &self,
+        meuexemplo: &Meuexemplo,
+        id: i64,
+    ) -> Result<(), anyhow::Error>;
+    
+    async fn delete_meuexemplo_by_id(&self, id: i64) -> Result<bool, anyhow::Error>;
+}
+
+// Logger trait para manter compatibilidade
+pub trait Logger {
+    fn chronometer(&self, method: &str, started_at: &Instant);
+    fn error(&self, message: &str, error: &str);
+}
+
+pub struct DefaultLogger;
+
+impl Logger for DefaultLogger {
+    fn chronometer(&self, method: &str, started_at: &Instant) {
+        let duration = started_at.elapsed();
+        info!(
+            method = method,
+            duration_ms = duration.as_millis(),
+            "Repository method completed"
+        );
+    }
+
+    fn error(&self, message: &str, error: &str) {
+        error!(message = message, error = error);
+    }
+}
+
+// Implementação do repositório
+pub struct MeuexemploRepository {
+    pg_read: Arc<PgPool>,
+    pg_write: Arc<PgPool>,
+    log: Box<dyn Logger + Send + Sync>,
+    observability: RepositoryObservability,
+}
+
+impl MeuexemploRepository {
+    pub fn new(
+        pg_write: Arc<PgPool>,
+        pg_read: Arc<PgPool>,
+        log: Box<dyn Logger + Send + Sync>,
+    ) -> Self {
+        Self {
+            pg_read,
+            pg_write,
+            log,
+            observability: RepositoryObservability::new("meuexemplo"),
+        }
+    }
+}
+
+#[async_trait]
+impl MeuexemploRepositoryIF for MeuexemploRepository {
+    async fn get_meuexemplo(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<ItemsPage<Vec<Meuexemplo>>, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track_query("SELECT", "repository.GetMeuexemplo");
+        
+        tracker.add_param("offset", offset);
+        tracker.add_param("limit", limit);
+
+        let result = async {
+            let mut meuexemplos: Vec<Meuexemplo> = Vec::new();
+
+            let rows = sqlx::query(SQL_MEUEXEMPLO_LIST)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&*self.pg_read)
+                .await;
+
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(e) => {
+                    self.log.error("MeuexemploRepository.repository.GetMeuexemplos.PG: ", &e.to_string());
+                    return Err(anyhow::anyhow!(e));
+                }
+            };
+
+            for row in rows {
+                let meuexemplo = Meuexemplo {
+                    id: row.get("id"),
+                    status_code: row.get("status_code"),
+                    name: row.get("name"),
+                    description: row.get("description"),
+                    allows_transactions: row.get("allows_transactions"),
+                    max_transaction_amount: row.get("max_transaction_amount"),
+                    created_at: row.get("created_at"),
+                    updated_at: row.get("updated_at"),
+                    full_count: 0, // Will be set below if needed
+                };
+                meuexemplos.push(meuexemplo);
+            }
+
+            let qty_records = if !meuexemplos.is_empty() {
+                meuexemplos[0].full_count
+            } else {
+                0
+            };
+
+            tracker.add_result("rows_returned", meuexemplos.len());
+            tracker.add_result("total_count", qty_records);
+
+            Ok::<ItemsPage<Vec<Meuexemplo>>, anyhow::Error>(ItemsPage {
+                offset,
+                limit,
+                total: qty_records,
+                items: meuexemplos,
+            })
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploRepository -> GetMeuexemplo", &started_at);
+        result
+    }
+
+    async fn get_meuexemplo_by_id(&self, id: i64) -> Result<Option<Meuexemplo>, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track_query("SELECT", "repository.GetMeuexemploById");
+        
+        tracker.add_param("repository.GetMeuexemploById.id", id);
+
+        let result = async {
+            let row = sqlx::query(SQL_GET_MEUEXEMPLO_BY_ID)
+                .bind(id)
+                .fetch_optional(&*self.pg_read)
+                .await;
+
+            let row = match row {
+                Ok(row) => row,
+                Err(e) => {
+                    self.log.error("MeuexemploRepository.repository.GetMeuexemploById: ", &e.to_string());
+                    return Err(anyhow::anyhow!(e));
+                }
+            };
+
+            if let Some(row) = row {
+                let meuexemplo = Meuexemplo {
+                    id: row.get("id"),
+                    status_code: row.get("status_code"),
+                    name: row.get("name"),
+                    description: row.get("description"),
+                    allows_transactions: row.get("allows_transactions"),
+                    max_transaction_amount: row.get("max_transaction_amount"),
+                    created_at: row.get("created_at"),
+                    updated_at: row.get("updated_at"),
+                    full_count: 0,
+                };
+
+                tracker.add_result("repository.GetMeuexemploById.found", true);
+                Ok(Some(meuexemplo))
+            } else {
+                Ok(None)
+            }
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploRepository -> GetMeuexemploById", &started_at);
+        result
+    }
+
+    async fn get_meuexemplo_by_status_code(
+        &self,
+        status_code: &str,
+    ) -> Result<Option<Meuexemplo>, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track_query("SELECT", "repository.GetMeuexemploByStatusCode");
+        
+        tracker.add_param("repository.GetMeuexemploByStatusCode.status_code", status_code);
+
+        let result = async {
+            let row = sqlx::query(SQL_GET_MEUEXEMPLO_BY_STATUS_CODE)
+                .bind(status_code)
+                .fetch_optional(&*self.pg_read)
+                .await;
+
+            let row = match row {
+                Ok(row) => row,
+                Err(e) => {
+                    self.log.error("MeuexemploRepository.repository.GetMeuexemploBystatuscode: ", &e.to_string());
+                    return Err(anyhow::anyhow!(e));
+                }
+            };
+
+            if let Some(row) = row {
+                let meuexemplo = Meuexemplo {
+                    id: row.get("id"),
+                    status_code: row.get("status_code"),
+                    name: row.get("name"),
+                    description: row.get("description"),
+                    allows_transactions: row.get("allows_transactions"),
+                    max_transaction_amount: row.get("max_transaction_amount"),
+                    created_at: row.get("created_at"),
+                    updated_at: row.get("updated_at"),
+                    full_count: 0,
+                };
+
+                tracker.add_result("found", true);
+                Ok(Some(meuexemplo))
+            } else {
+                Ok(None)
+            }
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploRepository -> GetMeuexemploByStatusCode", &started_at);
+        result
+    }
+
+    async fn delete_meuexemplo_by_id(&self, id: i64) -> Result<bool, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track_query("DELETE", "repository.DeleteMeuexemploById");
+        
+        tracker.add_param("id", id);
+
+        let result = async {
+            let command_tag = sqlx::query(SQL_MEUEXEMPLO_DELETE_BY_ID)
+                .bind(id)
+                .execute(&*self.pg_write)
+                .await;
+
+            let command_tag = match command_tag {
+                Ok(tag) => tag,
+                Err(e) => {
+                    self.log.error("MeuexemploRepository.repository.DeleteMeuexemploById: ", &e.to_string());
+                    return Err(anyhow::anyhow!(e));
+                }
+            };
+
+            let rows_affected = command_tag.rows_affected();
+            let result = rows_affected > 0;
+
+            tracker.add_result("repository.DeleteMeuexemploById.rows_affected", rows_affected);
+            tracker.add_result("repository.DeleteMeuexemploById.deleted", result);
+
+            Ok::<bool, anyhow::Error>(result)
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploRepository -> DeleteMeuexemploById", &started_at);
+        result
+    }
+
+    async fn insert_meuexemplo(&self, meuexemplo: &Meuexemplo) -> Result<i64, anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track_query("INSERT", "repository.InsertMeuexemplo");
+        
+        tracker.add_param("repository.InsertMeuexemplo.name", &meuexemplo.name);
+        tracker.add_param("repository.InsertMeuexemplo.status_code", &meuexemplo.status_code);
+
+        let result = async {
+            let row = sqlx::query(SQL_MEUEXEMPLO_INSERT)
+                .bind(&meuexemplo.status_code)
+                .bind(&meuexemplo.name)
+                .bind(&meuexemplo.description)
+                .bind(meuexemplo.allows_transactions)
+                .bind(meuexemplo.max_transaction_amount)
+                .bind(meuexemplo.created_at)
+                .bind(meuexemplo.updated_at)
+                .fetch_one(&*self.pg_write)
+                .await;
+
+            let row = match row {
+                Ok(row) => row,
+                Err(e) => {
+                    self.log.error("MeuexemploRepository.repository.InsertMeuexemplo.PG: ", &e.to_string());
+                    return Err(anyhow::anyhow!(e));
+                }
+            };
+
+            let inserted_id: i64 = row.get("id");
+            tracker.add_result("inserted_id", inserted_id);
+
+            Ok::<i64, anyhow::Error>(inserted_id)
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploRepository -> InsertMeuexemplo", &started_at);
+        result
+    }
+
+    async fn update_meuexemplo(
+        &self,
+        meuexemplo: &Meuexemplo,
+        id: i64,
+    ) -> Result<(), anyhow::Error> {
+        let started_at = Instant::now();
+        let mut tracker = self.observability.track_query("UPDATE", "repository.UpdateMeuexemplo");
+        
+        tracker.add_param("repository.UpdateMeuexemplo.id", id);
+        tracker.add_param("repository.UpdateMeuexemplo.name", &meuexemplo.name);
+        tracker.add_param("repository.UpdateMeuexemplo.status_code", &meuexemplo.status_code);
+
+        let result = async {
+            let command_tag = sqlx::query(SQL_MEUEXEMPLO_UPDATE)
+                .bind(&meuexemplo.status_code)
+                .bind(&meuexemplo.name)
+                .bind(&meuexemplo.description)
+                .bind(meuexemplo.allows_transactions)
+                .bind(meuexemplo.max_transaction_amount)
+                .bind(meuexemplo.created_at)
+                .bind(meuexemplo.updated_at)
+                .bind(id)
+                .execute(&*self.pg_write)
+                .await;
+
+            let command_tag = match command_tag {
+                Ok(tag) => tag,
+                Err(e) => {
+                    self.log.error("MeuexemploRepository.repository.UpdateMeuexemplo.PG: ", &e.to_string());
+                    return Err(anyhow::anyhow!(e));
+                }
+            };
+
+            let rows_affected = command_tag.rows_affected();
+            if rows_affected == 0 {
+                let err = anyhow::anyhow!("no rows affected");
+                self.log.error("CustomerRepository.repository.UpdateMeuexemplo.PG: ", &err.to_string());
+                return Err(err);
+            }
+
+            tracker.add_result("repository.UpdateMeuexemplo.rows_affected", rows_affected);
+            Ok::<(), anyhow::Error>(())
+        }.await;
+
+        match &result {
+            Ok(_) => tracker.finish(None),
+            Err(e) => tracker.finish(Some(e)),
+        }
+
+        self.log.chronometer("MeuexemploRepository -> UpdateMeuexemplo", &started_at);
+        result
+    }
+}---------------------------------------------
+./app/meuexemplo/handler/meuexemplo.rs
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::Json,
+    routing::{delete, get, post, put},
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::{error, info};
+
+// Imports dos módulos (assumindo que existem)
+use crate::model::{ItemsPage, Meuexemplo};
+use crate::service::MeuexemploServiceIF;
+
+// Constantes de mensagens de erro (equivalente ao app)
+pub mod app {
+    pub const MESSAGE: &str = "message";
+    pub const MSG_OFFSET_LIMIT: &str = "Invalid offset or limit parameter";
+    pub const MSG_BAD_REQUEST: &str = "Bad request";
+    pub const MSG_INTERNAL_ERROR: &str = "Internal server error";
+}
+
+// Query parameters para paginação
+#[derive(Debug, Deserialize)]
+pub struct PaginationQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+// Sistema de observabilidade para Handler
+pub struct HandlerTracker {
+    operation: String,
+    started_at: Instant,
+    params: std::collections::HashMap<String, String>,
+    results: std::collections::HashMap<String, String>,
+}
+
+impl HandlerTracker {
+    pub fn new(operation: &str) -> Self {
+        Self {
+            operation: operation.to_string(),
+            started_at: Instant::now(),
+            params: std::collections::HashMap::new(),
+            results: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn add_param<T: ToString>(&mut self, key: &str, value: T) {
+        self.params.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn add_result<T: ToString>(&mut self, key: &str, value: T) {
+        self.results.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn finish(self, error: Option<&anyhow::Error>) {
+        let duration = self.started_at.elapsed();
+        
+        if let Some(err) = error {
+            error!(
+                operation = %self.operation,
+                duration_ms = duration.as_millis(),
+                error = %err,
+                params = ?self.params,
+                "Handler operation failed"
+            );
+        } else {
+            info!(
+                operation = %self.operation,
+                duration_ms = duration.as_millis(),
+                params = ?self.params,
+                results = ?self.results,
+                "Handler operation completed"
+            );
+        }
+    }
+}
+
+pub struct HandlerObservability {
+    service_name: String,
+}
+
+impl HandlerObservability {
+    pub fn new(service_name: &str) -> Self {
+        Self {
+            service_name: service_name.to_string(),
+        }
+    }
+
+    pub fn track(&self, operation: &str) -> HandlerTracker {
+        HandlerTracker::new(operation)
+    }
+}
+
+// Logger trait para manter compatibilidade
+pub trait Logger {
+    fn chronometer(&self, method: &str, started_at: &Instant);
+}
+
+pub struct DefaultLogger;
+
+impl Logger for DefaultLogger {
+    fn chronometer(&self, method: &str, started_at: &Instant) {
+        let duration = started_at.elapsed();
+        info!(
+            method = method,
+            duration_ms = duration.as_millis(),
+            "Handler method completed"
+        );
+    }
+}
+
+// Struct Handler (equivalente ao Handler do Go)
+#[derive(Clone)]
+pub struct Handler {
+    service_if: Arc<dyn MeuexemploServiceIF + Send + Sync>,
+    log: Arc<dyn Logger + Send + Sync>,
+    observability: Arc<HandlerObservability>,
+}
+
+impl Handler {
+    pub fn new(
+        service_if: Arc<dyn MeuexemploServiceIF + Send + Sync>,
+        log: Arc<dyn Logger + Send + Sync>,
+    ) -> Self {
+        Self {
+            service_if,
+            log,
+            observability: Arc::new(HandlerObservability::new("meuexemplo")),
+        }
+    }
+
+    // Criar router com todas as rotas
+    pub fn routes(&self) -> Router {
+        Router::new()
+            .route("/meuexemplo", get(Self::get_meuexemplo))
+            .route("/meuexemplo/:id", get(Self::get_meuexemplo_by_id))
+            .route("/meuexemplo/status/:statuscode", get(Self::get_meuexemplo_by_status_code))
+            .route("/meuexemplo", post(Self::insert_meuexemplo))
+            .route("/meuexemplo/:id", put(Self::update_meuexemplo))
+            .route("/meuexemplo/:id", delete(Self::delete_meuexemplo_by_id))
+            .with_state(self.clone())
+    }
+
+    // GET /meuexemplo?limit=10&offset=0
+    pub async fn get_meuexemplo(
+        State(handler): State<Handler>,
+        Query(pagination): Query<PaginationQuery>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        let started_at = Instant::now();
+        let mut tracker = handler.observability.track("get_list");
+        let mut error_result: Option<anyhow::Error> = None;
+
+        let result = async {
+            // Validar parâmetros
+            let limit = pagination.limit.unwrap_or(10);
+            let offset = pagination.offset.unwrap_or(0);
+
+            tracker.add_param("limit", limit);
+            tracker.add_param("offset", offset);
+
+            if limit <= 0 || offset < 0 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ app::MESSAGE: app::MSG_OFFSET_LIMIT }))
+                ));
+            }
+
+            // Chamar service
+            let result = handler.service_if.get_meuexemplo(offset, limit).await;
+            
+            match result {
+                Ok(items_page) => {
+                    tracker.add_result("count", items_page.items.len());
+                    tracker.add_result("total", items_page.total);
+                    
+                    Ok(Json(serde_json::to_value(&items_page).unwrap()))
+                }
+                Err(e) => {
+                    error_result = Some(e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ app::MESSAGE: app::MSG_BAD_REQUEST }))
+                    ))
+                }
+            }
+        }.await;
+
+        // Logging e tracking
+        tracker.finish(error_result.as_ref());
+        handler.log.chronometer("MeuexemploHandle -> GetMeuexemplo", &started_at);
+        
+        result
+    }
+
+    // GET /meuexemplo/:id
+    pub async fn get_meuexemplo_by_id(
+        State(handler): State<Handler>,
+        Path(id): Path<String>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        let started_at = Instant::now();
+        let mut tracker = handler.observability.track("get_by_id");
+        let mut error_result: Option<anyhow::Error> = None;
+
+        let result = async {
+            tracker.add_param("id", &id);
+
+            // Parse ID
+            let id = match id.parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ app::MESSAGE: app::MSG_BAD_REQUEST }))
+                    ));
+                }
+            };
+
+            // Chamar service
+            let result = handler.service_if.get_meuexemplo_by_id(id).await;
+            
+            match result {
+                Ok(meuexemplo) => {
+                    tracker.add_result("found", meuexemplo.is_some());
+                    if let Some(ref item) = meuexemplo {
+                        tracker.add_result("id", item.id);
+                    }
+                    
+                    Ok(Json(serde_json::to_value(&meuexemplo).unwrap()))
+                }
+                Err(e) => {
+                    error_result = Some(e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ app::MESSAGE: app::MSG_BAD_REQUEST }))
+                    ))
+                }
+            }
+        }.await;
+
+        // Logging e tracking
+        tracker.finish(error_result.as_ref());
+        handler.log.chronometer("MeuexemploHandle -> GetMeuexemploById", &started_at);
+        
+        result
+    }
+
+    // GET /meuexemplo/status/:statuscode
+    pub async fn get_meuexemplo_by_status_code(
+        State(handler): State<Handler>,
+        Path(statuscode): Path<String>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        let started_at = Instant::now();
+        let mut tracker = handler.observability.track("handler.GetMeuexemploByStatusCode");
+        let mut error_result: Option<anyhow::Error> = None;
+
+        let result = async {
+            tracker.add_param("handler.GetMeuexemploByStatusCode.status_code", &statuscode);
+
+            if statuscode.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ app::MESSAGE: app::MSG_BAD_REQUEST }))
+                ));
+            }
+
+            // Chamar service
+            let result = handler.service_if.get_meuexemplo_by_status_code(&statuscode).await;
+            
+            match result {
+                Ok(meuexemplo) => {
+                    tracker.add_result("handler.GetMeuexemploByStatusCode.found", meuexemplo.is_some());
+                    Ok(Json(serde_json::to_value(&meuexemplo).unwrap()))
+                }
+                Err(e) => {
+                    error_result = Some(e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ app::MESSAGE: app::MSG_BAD_REQUEST }))
+                    ))
+                }
+            }
+        }.await;
+
+        // Logging e tracking
+        tracker.finish(error_result.as_ref());
+        handler.log.chronometer("MeuexemploHandle -> GetMeuexemploByStatusCode", &started_at);
+        
+        result
+    }
+
+    // DELETE /meuexemplo/:id
+    pub async fn delete_meuexemplo_by_id(
+        State(handler): State<Handler>,
+        Path(id): Path<String>,
+    ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+        let started_at = Instant::now();
+        let mut tracker = handler.observability.track("handler.DeleteMeuexemploById");
+        let mut error_result: Option<anyhow::Error> = None;
+
+        let result = async {
+            tracker.add_param("handler.DeleteMeuexemploById.id", &id);
+
+            // Parse ID
+            let id = match id.parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ app::MESSAGE: app::MSG_BAD_REQUEST }))
+                    ));
+                }
+            };
+
+            // Chamar service
+            let result = handler.service_if.delete_meuexemplo_by_id(id).await;
+            
+            match result {
+                Ok(deleted) => {
+                    if !deleted {
+                        tracker.add_result("handler.DeleteMeuexemploById.not_found", true);
+                        return Err((
+                            StatusCode::NOT_FOUND,
+                            Json(json!({ app::MESSAGE: "Item not found" }))
+                        ));
+                    }
+
+                    tracker.add_result("handler.DeleteMeuexemploById.deleted", true);
+                    Ok(StatusCode::NO_CONTENT)
+                }
+                Err(e) => {
+                    error_result = Some(e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ app::MESSAGE: app::MSG_INTERNAL_ERROR }))
+                    ))
+                }
+            }
+        }.await;
+
+        // Logging e tracking
+        tracker.finish(error_result.as_ref());
+        handler.log.chronometer("MeuexemploHandle -> DeleteMeuexemploById", &started_at);
+        
+        result
+    }
+
+    // POST /meuexemplo
+    pub async fn insert_meuexemplo(
+        State(handler): State<Handler>,
+        Json(meuexemplo): Json<Meuexemplo>,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        let started_at = Instant::now();
+        let mut tracker = handler.observability.track("handler.InsertMeuexemplo");
+        let mut error_result: Option<anyhow::Error> = None;
+
+        let result = async {
+            tracker.add_param("handler.InsertMeuexemplo.name", &meuexemplo.name);
+            tracker.add_param("handler.InsertMeuexemplo.status_code", &meuexemplo.status_code);
+
+            // Validação
+            if meuexemplo.name.is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ app::MESSAGE: "Name is required" }))
+                ));
+            }
+
+            // Chamar service
+            let result = handler.service_if.insert_meuexemplo(&meuexemplo).await;
+            
+            match result {
+                Ok(inserted_id) => {
+                    tracker.add_result("handler.InsertMeuexemplo.inserted_id", inserted_id);
+                    Ok(Json(json!({ "id": inserted_id })))
+                }
+                Err(e) => {
+                    error_result = Some(e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ app::MESSAGE: app::MSG_INTERNAL_ERROR }))
+                    ))
+                }
+            }
+        }.await;
+
+        // Logging e tracking
+        tracker.finish(error_result.as_ref());
+        handler.log.chronometer("MeuexemploHandle -> InsertMeuexemplo", &started_at);
+        
+        result
+    }
+
+    // PUT /meuexemplo/:id
+    pub async fn update_meuexemplo(
+        State(handler): State<Handler>,
+        Path(id): Path<String>,
+        Json(meuexemplo): Json<Meuexemplo>,
+    ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+        let started_at = Instant::now();
+        let mut tracker = handler.observability.track("handler.UpdateMeuexemplo");
+        let mut error_result: Option<anyhow::Error> = None;
+
+        let result = async {
+            tracker.add_param("handler.UpdateMeuexemplo.id", &id);
+
+            // Parse ID
+            let id = match id.parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ app::MESSAGE: app::MSG_BAD_REQUEST }))
+                    ));
+                }
+            };
+
+            tracker.add_param("name", &meuexemplo.name);
+            tracker.add_param("handler.UpdateMeuexemplo.status_code", &meuexemplo.status_code);
+
+            // Chamar service
+            let result = handler.service_if.update_meuexemplo(&meuexemplo, id).await;
+            
+            match result {
+                Ok(()) => {
+                    tracker.add_result("handler.UpdateMeuexemplo.updated", true);
+                    Ok(StatusCode::NO_CONTENT)
+                }
+                Err(e) => {
+                    error_result = Some(e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ app::MESSAGE: app::MSG_INTERNAL_ERROR }))
+                    ))
+                }
+            }
+        }.await;
+
+        // Logging e tracking
+        tracker.finish(error_result.as_ref());
+        handler.log.chronometer("MeuexemploHandle -> UpdateMeuexemplo", &started_at);
+        
+        result
+    }
+}
+
+// Exemplo de configuração do servidor
+pub async fn create_app() -> Router {
+    // Setup do service (isso viria de dependency injection)
+    let service = create_mock_service(); // Implementar conforme necessário
+    let logger = Arc::new(DefaultLogger);
+    
+    // Criar handler
+    let handler = Handler::new(service, logger);
+    
+    // Retornar router com todas as rotas
+    handler.routes()
+}
+
+// Mock service para exemplo (remover em produção)
+fn create_mock_service() -> Arc<dyn MeuexemploServiceIF + Send + Sync> {
+    // Implementar com o service real
+    unimplemented!("Implement with real service")
+}
+
+// Exemplo de main function
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    // Configurar tracing/logging
+    tracing_subscriber::fmt::init();
+
+    // Criar app
+    let app = create_app().await;
+
+    // Iniciar servidor
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    println!("Server running on http://0.0.0.0:3000");
+    
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{Method, Request};
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    // Mock service para testes
+    struct MockService;
+
+    #[async_trait::async_trait]
+    impl MeuexemploServiceIF for MockService {
+        async fn get_meuexemplo(
+            &self,
+            _offset: i64,
+            _limit: i64,
+        ) -> Result<ItemsPage<Vec<Meuexemplo>>, anyhow::Error> {
+            Ok(ItemsPage {
+                offset: 0,
+                limit: 10,
+                total: 1,
+                items: vec![],
+            })
+        }
+
+        async fn get_meuexemplo_by_id(&self, _id: i64) -> Result<Option<Meuexemplo>, anyhow::Error> {
+            Ok(None)
+        }
+
+        async fn get_meuexemplo_by_status_code(
+            &self,
+            _status_code: &str,
+        ) -> Result<Option<Meuexemplo>, anyhow::Error> {
+            Ok(None)
+        }
+
+        async fn insert_meuexemplo(&self, _meuexemplo: &Meuexemplo) -> Result<i64, anyhow::Error> {
+            Ok(1)
+        }
+
+        async fn update_meuexemplo(
+            &self,
+            _meuexemplo: &Meuexemplo,
+            _id: i64,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        async fn delete_meuexemplo_by_id(&self, _id: i64) -> Result<bool, anyhow::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_meuexemplo() {
+        let service = Arc::new(MockService);
+        let logger = Arc::new(DefaultLogger);
+        let handler = Handler::new(service, logger);
+        let app = handler.routes();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/meuexemplo?limit=10&offset=0")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_meuexemplo_by_id() {
+        let service = Arc::new(MockService);
+        let logger = Arc::new(DefaultLogger);
+        let handler = Handler::new(service, logger);
+        let app = handler.routes();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/meuexemplo/1")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}---------------------------------------------
+./app/meuexemplo/handler/register.rs
+use axum::{
+    routing::{delete, get, post, put},
+    Router,
+};
+use std::sync::Arc;
+
+// Imports dos módulos necessários
+use crate::handler::Handler;
+use crate::service::MeuexemploServiceIF;
+
+// Logger trait
+pub trait Logger: Send + Sync {}
+
+// Middleware de métricas (equivalente ao observabilidade.EnhancedHTTPMetricsMiddleware)
+pub fn enhanced_http_metrics_middleware(service_name: &str) -> axum::middleware::FromFn<impl Fn(axum::extract::Request, axum::middleware::Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<axum::response::Response, axum::http::StatusCode>> + Send>>> {
+    let service_name = service_name.to_string();
+    axum::middleware::from_fn(move |req, next| {
+        let service_name = service_name.clone();
+        Box::pin(async move {
+            // Aqui viria a lógica de métricas
+            next.run(req).await
+        })
+    })
+}
+
+// Função equivalente ao RegisterMeuexemploHTTPEndpoints
+pub fn register_meuexemplo_http_endpoints(
+    uc: Arc<dyn MeuexemploServiceIF + Send + Sync>,
+    log: Arc<dyn Logger>,
+) -> Router {
+    let h = Handler::new(uc, log);
+
+    let meuexemplo_group = Router::new()
+        .route("", get(Handler::get_meuexemplo))
+        .route("/:id", get(Handler::get_meuexemplo_by_id))
+        .route("/statuscode/:statuscode", get(Handler::get_meuexemplo_by_status_code))
+        .route("", post(Handler::insert_meuexemplo))
+        .route("/:id", put(Handler::update_meuexemplo))
+        .route("/:id", delete(Handler::delete_meuexemplo_by_id))
+        .with_state(h)
+        .layer(enhanced_http_metrics_middleware("meuexemplo"));
+
+    Router::new().nest("/meuexemplo", meuexemplo_group)
+}---------------------------------------------
+./Cargo.toml
+[package]
+name = "meuexemplo-repository"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Database
+sqlx = { version = "0.7", features = [
+    "runtime-tokio-rustls",
+    "postgres", 
+    "chrono",
+    "uuid",
+    "macros",
+    "migrate",
+    "rust_decimal"
+] }
+
+# Async trait support
+async-trait = "0.1"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Decimal numbers (equivalent to pgtype.Numeric)
+rust_decimal = { version = "1.0", features = ["serde"] }
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+hyper = { version = "1.0", features = ["full"] }
+
+[dev-dependencies]
+# Testing
+tokio-test = "0.4"
+tower-test = "0.4"---------------------------------------------
+./main.rs
+use std::env;
+
+mod config;
+mod server;
+
+#[tokio::main]
+async fn main() {
+    config::init();
+    
+    let mut app = server::App::new();
+    app.start().await;
+    
+    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    
+    if let Err(err) = app.run(&port).await {
+        panic!("{}", err);
+    }
+    
+    app.stop().await;
+}---------------------------------------------
+./utils/observabilidade/wrappers.rs
+use std::time::Instant;
+
+// HandlerObservability - wrapper simplificado para handlers
+pub struct HandlerObservability {
+    usecase: String,
+}
+
+impl HandlerObservability {
+    // NewHandlerObservability cria novo observador para handler
+    pub fn new(usecase: &str) -> Self {
+        Self {
+            usecase: usecase.to_string(),
+        }
+    }
+
+    // Track inicia rastreamento de uma operação do handler
+    pub fn track(&self, operation: &str) -> crate::observabilidade::ObservabilityTracker {
+        crate::observabilidade::start_operation(&self.usecase, operation, "handler")
+    }
+}
+
+// ServiceObservability - wrapper para services
+pub struct ServiceObservability {
+    usecase: String,
+}
+
+impl ServiceObservability {
+    // NewServiceObservability cria novo observador para service
+    pub fn new(usecase: &str) -> Self {
+        Self {
+            usecase: usecase.to_string(),
+        }
+    }
+
+    // Track inicia rastreamento de uma operação do service
+    pub fn track(&self, operation: &str) -> crate::observabilidade::ObservabilityTracker {
+        crate::observabilidade::start_operation(&self.usecase, operation, "service")
+    }
+}
+
+// RepositoryObservability - wrapper para repositories
+pub struct RepositoryObservability {
+    usecase: String,
+}
+
+impl RepositoryObservability {
+    // NewRepositoryObservability cria novo observador para repository
+    pub fn new(usecase: &str) -> Self {
+        Self {
+            usecase: usecase.to_string(),
+        }
+    }
+
+    // Track inicia rastreamento de uma operação do repository
+    pub fn track(&self, operation: &str) -> crate::observabilidade::ObservabilityTracker {
+        crate::observabilidade::start_operation(&self.usecase, operation, "repository")
+    }
+
+    // TrackQuery rastreia especificamente queries de banco (mais específico para repositories)
+    pub fn track_query(&self, operation: &str, table: &str) -> QueryTracker {
+        let tracker = crate::observabilidade::start_operation(
+            &self.usecase,
+            &format!("{}_{}", operation, table),
+            "repository"
+        );
+        
+        QueryTracker {
+            observability_tracker: tracker,
+            operation: operation.to_string(),
+            table: table.to_string(),
+            usecase: self.usecase.clone(),
+            start: Instant::now(),
+        }
+    }
+}
+
+// QueryTracker - especializado para queries de banco
+pub struct QueryTracker {
+    observability_tracker: crate::observabilidade::ObservabilityTracker,
+    operation: String,
+    table: String,
+    usecase: String,
+    start: Instant,
+}
+
+impl QueryTracker {
+    pub fn add_param<T: ToString>(&mut self, key: &str, value: T) {
+        self.observability_tracker.add_param(key, value);
+    }
+
+    pub fn add_result<T: ToString>(&mut self, key: &str, value: T) {
+        self.observability_tracker.add_result(key, value);
+    }
+
+    // Finish finaliza com métricas específicas de DB
+    pub fn finish(self, err: Option<&anyhow::Error>) {
+        let duration = self.start.elapsed();
+
+        // Registrar métricas de DB antes do finish geral
+        crate::observabilidade::record_db_query(
+            &self.usecase,
+            &self.operation,
+            &self.table,
+            duration,
+            err,
+        );
+
+        // Chamar finish do tracker geral
+        self.observability_tracker.finish(err);
+    }
+}---------------------------------------------
+./utils/observabilidade/init.rs
+use opentelemetry::global;
+use opentelemetry::KeyValue;
+use opentelemetry_sdk::metrics::MeterProvider;
+use opentelemetry_sdk::Resource;
+use prometheus::{Encoder, TextEncoder};
+use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::time;
+
+static METER: OnceLock<opentelemetry::metrics::Meter> = OnceLock::new();
+
+pub fn meter() -> &'static opentelemetry::metrics::Meter {
+    METER.get().expect("Meter not initialized")
+}
+
+// InitObservability inicializa OpenTelemetry com Prometheus
+pub async fn init_observability(service_name: &str, service_version: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Criar resource
+    let resource = Resource::new(vec![
+        KeyValue::new("service.name", service_name.to_string()),
+        KeyValue::new("service.version", service_version.to_string()),
+    ]);
+
+    // Configurar Prometheus exporter
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_resource(resource)
+        .build()?;
+
+    // Criar metric provider
+    let provider = MeterProvider::builder()
+        .with_reader(exporter)
+        .build();
+
+    // Definir como global
+    global::set_meter_provider(provider.clone());
+
+    // Criar meter global
+    let meter = provider.meter(service_name);
+    METER.set(meter).map_err(|_| "Failed to set global meter")?;
+
+    // Inicializar métricas básicas
+    init_metrics().await?;
+
+    // Inicializar métricas por camada
+    init_layer_metrics().await?;
+
+    // Inicializar métricas de contexto
+    init_context_metrics().await?;
+
+    // Inicializar métricas de sistema
+    tokio::spawn(start_system_metrics());
+
+    println!("✅ Observabilidade completa inicializada com sucesso");
+    Ok(())
+}
+
+// StartMetricsServer inicia o servidor de métricas
+pub async fn start_metrics_server(port: &str) {
+    use axum::{routing::get, Router};
+    use axum::response::Response;
+    use axum::http::header;
+
+    async fn metrics_handler() -> Response<String> {
+        let encoder = TextEncoder::new();
+        let metric_families = prometheus::gather();
+        let mut buffer = Vec::new();
+        encoder.encode(&metric_families, &mut buffer).unwrap();
+        
+        Response::builder()
+            .header(header::CONTENT_TYPE, encoder.format_type())
+            .body(String::from_utf8(buffer).unwrap())
+            .unwrap()
+    }
+
+    let app = Router::new().route("/metrics", get(metrics_handler));
+
+    let addr = format!("0.0.0.0:{}", port);
+    println!("🔍 Servidor de métricas iniciado na porta {}", port);
+    println!("📊 Métricas disponíveis em: http://localhost:{}/metrics", port);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    // Implementar inicialização de métricas básicas
+    Ok(())
+}
+
+async fn init_layer_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    // Implementar inicialização de métricas por camada
+    Ok(())
+}
+
+async fn init_context_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    // Implementar inicialização de métricas de contexto
+    Ok(())
+}
+
+async fn start_system_metrics() {
+    // Implementar métricas de sistema
+}---------------------------------------------
+./utils/observabilidade/tracker.rs
+use opentelemetry::KeyValue;
+use std::collections::HashMap;
+use std::time::Instant;
+
+// ObservabilityTracker rastreia uma operação completa com defer
+pub struct ObservabilityTracker {
+    usecase: String,
+    operation: String,
+    layer: String,
+    start: Instant,
+    params: HashMap<String, String>,
+    result_data: HashMap<String, String>,
+    timeout_detector: crate::observabilidade::TimeoutDetector,
+    layer_timing: crate::observabilidade::LayerTiming,
+}
+
+impl ObservabilityTracker {
+    // AddParam adiciona parâmetros para logging (opcional)
+    pub fn add_param<T: ToString>(&mut self, key: &str, value: T) {
+        self.params.insert(key.to_string(), value.to_string());
+    }
+
+    // AddResult adiciona dados do resultado (opcional)
+    pub fn add_result<T: ToString>(&mut self, key: &str, value: T) {
+        self.result_data.insert(key.to_string(), value.to_string());
+    }
+
+    // Finish finaliza o rastreamento - DEVE ser chamado com defer
+    pub fn finish(self, err: Option<&anyhow::Error>) {
+        let duration = self.start.elapsed();
+
+        // 1. Verificar timeout
+        self.timeout_detector.check_timeout(false, false); // Simplificado
+
+        // 2. Finalizar timing da camada
+        self.layer_timing.finish(err);
+
+        // 3. Registrar métricas específicas por camada
+        self.record_layer_metrics(duration, err);
+
+        // 4. Registrar métricas de negócio se for service layer
+        if self.layer == "service" {
+            crate::observabilidade::record_business_operation(
+                &self.usecase,
+                &self.operation,
+                duration,
+                err.is_none(),
+            );
+        }
+
+        // 5. Log estruturado automático
+        self.record_structured_log(duration, err);
+    }
+
+    // recordLayerMetrics registra métricas específicas da camada
+    fn record_layer_metrics(&self, duration: std::time::Duration, err: Option<&anyhow::Error>) {
+        let mut attrs = vec![
+            KeyValue::new("usecase", self.usecase.clone()),
+            KeyValue::new("operation", self.operation.clone()),
+            KeyValue::new("layer", self.layer.clone()),
+            KeyValue::new("success", err.is_none()),
+        ];
+
+        // Adicionar parâmetros como atributos (limitado)
+        for (key, value) in &self.params {
+            if attrs.len() < 10 {
+                attrs.push(KeyValue::new(format!("param_{}", key), value.clone()));
+            }
+        }
+
+        // Registrar métricas baseadas na camada seria feito aqui usando as funções já definidas
+        // Por exemplo: record_handler_duration, etc.
+
+        // Registrar operação geral
+        let status = if err.is_some() { "error" } else { "success" };
+        attrs.push(KeyValue::new("status", status));
+    }
+
+    // recordStructuredLog cria log estruturado automático
+    fn record_structured_log(&self, duration: std::time::Duration, err: Option<&anyhow::Error>) {
+        let mut log_data = HashMap::new();
+        log_data.insert("usecase".to_string(), self.usecase.clone());
+        log_data.insert("operation".to_string(), self.operation.clone());
+        log_data.insert("layer".to_string(), self.layer.clone());
+        log_data.insert("duration_ms".to_string(), duration.as_millis().to_string());
+        log_data.insert("success".to_string(), err.is_none().to_string());
+        log_data.insert("timestamp".to_string(), chrono::Utc::now().to_rfc3339());
+
+        // Adicionar parâmetros
+        for (key, value) in &self.params {
+            log_data.insert(format!("param_{}", key), value.clone());
+        }
+
+        // Adicionar resultado
+        for (key, value) in &self.result_data {
+            log_data.insert(format!("result_{}", key), value.clone());
+        }
+
+        // Adicionar erro se existir
+        if let Some(error) = err {
+            log_data.insert("error".to_string(), error.to_string());
+            log_data.insert("error_type".to_string(), get_error_type(error));
+        }
+
+        // Registrar como métrica de log estruturado
+        record_structured_log_metric(log_data);
+    }
+}
+
+// StartOperation inicia o rastreamento de uma operação
+pub fn start_operation(usecase: &str, operation: &str, layer: &str) -> ObservabilityTracker {
+    ObservabilityTracker {
+        usecase: usecase.to_string(),
+        operation: operation.to_string(),
+        layer: layer.to_string(),
+        start: Instant::now(),
+        params: HashMap::new(),
+        result_data: HashMap::new(),
+        timeout_detector: crate::observabilidade::TimeoutDetector::new(usecase, operation),
+        layer_timing: crate::observabilidade::LayerTiming::new(usecase, operation, layer),
+    }
+}
+
+// Helpers
+fn is_validation_error(err: &anyhow::Error) -> bool {
+    let err_str = err.to_string();
+    err_str.contains("validation") ||
+        err_str.contains("invalid") ||
+        err_str.contains("required") ||
+        err_str.contains("Bad Request")
+}
+
+fn get_error_type(err: &anyhow::Error) -> String {
+    let err_str = err.to_string();
+
+    if err_str.contains("timeout") || err_str.contains("deadline") {
+        "timeout".to_string()
+    } else if err_str.contains("connection") || err_str.contains("network") {
+        "network".to_string()
+    } else if is_validation_error(err) {
+        "validation".to_string()
+    } else if err_str.contains("not found") {
+        "not_found".to_string()
+    } else {
+        "internal".to_string()
+    }
+}
+
+fn record_structured_log_metric(log_data: HashMap<String, String>) {
+    let mut attrs = Vec::new();
+
+    for (key, value) in log_data {
+        if attrs.len() < 15 {
+            attrs.push(KeyValue::new(key, value));
+        }
+    }
+
+    // Registrar como métrica seria feito aqui
+}---------------------------------------------
+./utils/observabilidade/context_middleware.rs
+use axum::{
+    extract::Request,
+    http::{HeaderMap, HeaderValue},
+    middleware::Next,
+    response::Response,
+};
+use opentelemetry::metrics::{Counter, Meter};
+use opentelemetry::KeyValue;
+use rand::Rng;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+static REQUESTS_WITHOUT_ID: OnceLock<Counter<u64>> = OnceLock::new();
+static REQUEST_ID_GENERATED: OnceLock<Counter<u64>> = OnceLock::new();
+
+// initContextMetrics inicializa métricas de contexto
+pub async fn init_context_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    let meter = crate::observabilidade::meter();
+
+    let requests_without_id = meter
+        .u64_counter("requests_without_id_total")
+        .with_description("Total number of requests without request ID")
+        .with_unit("1")
+        .init();
+
+    let request_id_generated = meter
+        .u64_counter("request_id_generated_total")
+        .with_description("Total number of generated request IDs")
+        .with_unit("1")
+        .init();
+
+    REQUESTS_WITHOUT_ID.set(requests_without_id).map_err(|_| "Failed to set requests_without_id")?;
+    REQUEST_ID_GENERATED.set(request_id_generated).map_err(|_| "Failed to set request_id_generated")?;
+
+    Ok(())
+}
+
+// generateRequestID gera um ID único para a requisição
+fn generate_request_id() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 8] = rng.gen();
+    hex::encode(bytes)
+}
+
+// RequestIDMiddleware adiciona Request ID a todas as requisições
+pub async fn request_id_middleware(mut request: Request, next: Next) -> Result<Response, axum::http::StatusCode> {
+    // Verificar se já existe um Request ID no header
+    let mut request_id = request
+        .headers()
+        .get("X-Request-ID")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let generated = if request_id.is_empty() {
+        // Gerar novo Request ID
+        request_id = generate_request_id();
+        true
+    } else {
+        false
+    };
+
+    // Registrar métrica
+    if let Some(counter) = REQUEST_ID_GENERATED.get() {
+        counter.add(1, &[KeyValue::new("generated", generated.to_string())]);
+    }
+
+    // Adicionar Request ID ao contexto
+    request.extensions_mut().insert(RequestId(request_id.clone()));
+
+    // Processar requisição
+    let mut response = next.run(request).await;
+
+    // Adicionar ao response header
+    response.headers_mut().insert(
+        "X-Request-ID",
+        HeaderValue::from_str(&request_id).unwrap_or_else(|_| HeaderValue::from_static("unknown"))
+    );
+
+    Ok(response)
+}
+
+// StructuredLoggingMiddleware adiciona logging estruturado
+pub fn structured_logging_middleware(usecase: String) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, axum::http::StatusCode>> + Send>> + Clone {
+    move |request: Request, next: Next| {
+        let usecase = usecase.clone();
+        Box::pin(async move {
+            let start = Instant::now();
+
+            // Capturar informações da requisição
+            let method = request.method().to_string();
+            let uri = request.uri().to_string();
+            let user_agent = request
+                .headers()
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+
+            let request_id = request
+                .extensions()
+                .get::<RequestId>()
+                .map(|r| r.0.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            // Processar requisição
+            let response = next.run(request).await;
+
+            // Calcular duração
+            let duration = start.elapsed();
+
+            // Log de saída da requisição
+            let log_attrs = vec![
+                KeyValue::new("usecase", usecase),
+                KeyValue::new("request_id", request_id),
+                KeyValue::new("method", method),
+                KeyValue::new("path", uri),
+                KeyValue::new("user_agent", user_agent),
+                KeyValue::new("status_code", response.status().as_u16() as i64),
+                KeyValue::new("duration_seconds", duration.as_secs_f64()),
+            ];
+
+            // Registrar métrica de log estruturado
+            record_structured_log(log_attrs);
+
+            Ok(response)
+        })
+    }
+}
+
+// TimeoutMiddleware adiciona timeout padrão se não existir
+pub async fn timeout_middleware(timeout: Duration) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, axum::http::StatusCode>> + Send>> {
+    move |request: Request, next: Next| {
+        Box::pin(async move {
+            tokio::time::timeout(timeout, next.run(request))
+                .await
+                .unwrap_or_else(|_| Err(axum::http::StatusCode::REQUEST_TIMEOUT))
+        })
+    }
+}
+
+// RecordStructuredLog registra log estruturado como métrica
+fn record_structured_log(attrs: Vec<KeyValue>) {
+    // Encontrar status code para determinar se foi erro
+    let mut status_code = 0;
+    for attr in &attrs {
+        if attr.key.as_str() == "status_code" {
+            if let opentelemetry::Value::I64(code) = &attr.value {
+                status_code = *code as u16;
+                break;
+            }
+        }
+    }
+
+    // Criar métrica baseada no status
+    if status_code >= 400 {
+        if let Some(counter) = REQUESTS_WITHOUT_ID.get() {
+            counter.add(1, &attrs);
+        }
+    }
+}
+
+// GetRequestIDFromContext obtém Request ID do contexto
+pub fn get_request_id_from_context(extensions: &axum::http::Extensions) -> String {
+    extensions
+        .get::<RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+// Estrutura para armazenar Request ID nas extensões
+#[derive(Clone)]
+pub struct RequestId(pub String);---------------------------------------------
+./utils/observabilidade/metrics.rs
+use opentelemetry::metrics::{Counter, Histogram, UpDownCounter};
+use opentelemetry::KeyValue;
+use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::time;
+
+// HTTP Metrics
+static HTTP_REQUESTS_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
+static HTTP_REQUEST_DURATION: OnceLock<Histogram<f64>> = OnceLock::new();
+static HTTP_ERRORS_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
+
+// Database Metrics
+static DB_CONNECTIONS_ACTIVE: OnceLock<UpDownCounter<i64>> = OnceLock::new();
+static DB_QUERY_DURATION: OnceLock<Histogram<f64>> = OnceLock::new();
+static DB_QUERIES_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
+static DB_QUERY_ERRORS: OnceLock<Counter<u64>> = OnceLock::new();
+
+// System Metrics
+static MEMORY_USAGE: OnceLock<UpDownCounter<i64>> = OnceLock::new();
+static GOROUTINES_ACTIVE: OnceLock<UpDownCounter<i64>> = OnceLock::new();
+static GC_DURATION: OnceLock<Histogram<f64>> = OnceLock::new();
+
+// Business Metrics
+static BUSINESS_OPERATIONS_TOTAL: OnceLock<Counter<u64>> = OnceLock::new();
+static BUSINESS_OPERATION_DURATION: OnceLock<Histogram<f64>> = OnceLock::new();
+
+// initMetrics inicializa todas as métricas básicas
+pub async fn init_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    let meter = crate::observabilidade::meter();
+
+    // HTTP Metrics
+    let http_requests_total = meter
+        .u64_counter("http_requests_total")
+        .with_description("Total number of HTTP requests")
+        .with_unit("1")
+        .init();
+
+    let http_request_duration = meter
+        .f64_histogram("http_request_duration_seconds")
+        .with_description("HTTP request duration in seconds")
+        .with_unit("s")
+        .init();
+
+    let http_errors_total = meter
+        .u64_counter("http_errors_total")
+        .with_description("Total number of HTTP errors")
+        .with_unit("1")
+        .init();
+
+    // Database Metrics
+    let db_connections_active = meter
+        .i64_up_down_counter("db_connections_active")
+        .with_description("Number of active database connections")
+        .with_unit("1")
+        .init();
+
+    let db_query_duration = meter
+        .f64_histogram("db_query_duration_seconds")
+        .with_description("Database query duration in seconds")
+        .with_unit("s")
+        .init();
+
+    let db_queries_total = meter
+        .u64_counter("db_queries_total")
+        .with_description("Total number of database queries")
+        .with_unit("1")
+        .init();
+
+    let db_query_errors = meter
+        .u64_counter("db_query_errors_total")
+        .with_description("Total number of database query errors")
+        .with_unit("1")
+        .init();
+
+    // System Metrics
+    let memory_usage = meter
+        .i64_up_down_counter("memory_usage_bytes")
+        .with_description("Memory usage in bytes")
+        .with_unit("bytes")
+        .init();
+
+    let goroutines_active = meter
+        .i64_up_down_counter("goroutines_active")
+        .with_description("Number of active goroutines")
+        .with_unit("1")
+        .init();
+
+    let gc_duration = meter
+        .f64_histogram("gc_duration_seconds")
+        .with_description("Garbage collection duration in seconds")
+        .with_unit("s")
+        .init();
+
+    // Business Metrics
+    let business_operations_total = meter
+        .u64_counter("business_operations_total")
+        .with_description("Total number of business operations")
+        .with_unit("1")
+        .init();
+
+    let business_operation_duration = meter
+        .f64_histogram("business_operation_duration_seconds")
+        .with_description("Business operation duration in seconds")
+        .with_unit("s")
+        .init();
+
+    // Set all metrics
+    HTTP_REQUESTS_TOTAL.set(http_requests_total).map_err(|_| "Failed to set http_requests_total")?;
+    HTTP_REQUEST_DURATION.set(http_request_duration).map_err(|_| "Failed to set http_request_duration")?;
+    HTTP_ERRORS_TOTAL.set(http_errors_total).map_err(|_| "Failed to set http_errors_total")?;
+    DB_CONNECTIONS_ACTIVE.set(db_connections_active).map_err(|_| "Failed to set db_connections_active")?;
+    DB_QUERY_DURATION.set(db_query_duration).map_err(|_| "Failed to set db_query_duration")?;
+    DB_QUERIES_TOTAL.set(db_queries_total).map_err(|_| "Failed to set db_queries_total")?;
+    DB_QUERY_ERRORS.set(db_query_errors).map_err(|_| "Failed to set db_query_errors")?;
+    MEMORY_USAGE.set(memory_usage).map_err(|_| "Failed to set memory_usage")?;
+    GOROUTINES_ACTIVE.set(goroutines_active).map_err(|_| "Failed to set goroutines_active")?;
+    GC_DURATION.set(gc_duration).map_err(|_| "Failed to set gc_duration")?;
+    BUSINESS_OPERATIONS_TOTAL.set(business_operations_total).map_err(|_| "Failed to set business_operations_total")?;
+    BUSINESS_OPERATION_DURATION.set(business_operation_duration).map_err(|_| "Failed to set business_operation_duration")?;
+
+    Ok(())
+}
+
+// RecordHTTPRequest registra uma requisição HTTP
+pub fn record_http_request(usecase: &str, method: &str, endpoint: &str, duration: Duration, status_code: u16) {
+    let attrs = vec![
+        KeyValue::new("usecase", usecase.to_string()),
+        KeyValue::new("method", method.to_string()),
+        KeyValue::new("endpoint", endpoint.to_string()),
+        KeyValue::new("status_code", status_code as i64),
+    ];
+
+    if let Some(counter) = HTTP_REQUESTS_TOTAL.get() {
+        counter.add(1, &attrs);
+    }
+    if let Some(histogram) = HTTP_REQUEST_DURATION.get() {
+        histogram.record(duration.as_secs_f64(), &attrs);
+    }
+
+    if status_code >= 400 {
+        if let Some(counter) = HTTP_ERRORS_TOTAL.get() {
+            counter.add(1, &attrs);
+        }
+    }
+}
+
+// RecordDBQuery registra uma query de banco de dados
+pub fn record_db_query(usecase: &str, operation: &str, table: &str, duration: Duration, error: Option<&anyhow::Error>) {
+    let attrs = vec![
+        KeyValue::new("usecase", usecase.to_string()),
+        KeyValue::new("operation", operation.to_string()),
+        KeyValue::new("table", table.to_string()),
+    ];
+
+    if let Some(counter) = DB_QUERIES_TOTAL.get() {
+        counter.add(1, &attrs);
+    }
+    if let Some(histogram) = DB_QUERY_DURATION.get() {
+        histogram.record(duration.as_secs_f64(), &attrs);
+    }
+
+    if error.is_some() {
+        if let Some(counter) = DB_QUERY_ERRORS.get() {
+            counter.add(1, &attrs);
+        }
+    }
+}
+
+// RecordBusinessOperation registra uma operação de negócio
+pub fn record_business_operation(usecase: &str, operation: &str, duration: Duration, success: bool) {
+    let attrs = vec![
+        KeyValue::new("usecase", usecase.to_string()),
+        KeyValue::new("operation", operation.to_string()),
+        KeyValue::new("success", success),
+    ];
+
+    if let Some(counter) = BUSINESS_OPERATIONS_TOTAL.get() {
+        counter.add(1, &attrs);
+    }
+    if let Some(histogram) = BUSINESS_OPERATION_DURATION.get() {
+        histogram.record(duration.as_secs_f64(), &attrs);
+    }
+}
+
+// UpdateDBConnections atualiza o número de conexões ativas do banco
+pub fn update_db_connections(usecase: &str, connections: i32) {
+    let attrs = vec![KeyValue::new("usecase", usecase.to_string())];
+    if let Some(counter) = DB_CONNECTIONS_ACTIVE.get() {
+        counter.add(connections as i64, &attrs);
+    }
+}
+
+// startSystemMetrics inicia a coleta de métricas do sistema
+pub async fn start_system_metrics() {
+    let mut interval = time::interval(Duration::from_secs(10));
+
+    loop {
+        interval.tick().await;
+
+        let attrs = vec![KeyValue::new("type", "heap")];
+
+        // Note: Rust não tem equivalente direto ao runtime.ReadMemStats do Go
+        // Aqui seria necessário usar crates como `sysinfo` para coletar métricas do sistema
+
+        if let Some(counter) = MEMORY_USAGE.get() {
+            // Placeholder - implementar com sysinfo
+            counter.add(0, &attrs);
+        }
+        if let Some(counter) = GOROUTINES_ACTIVE.get() {
+            // Placeholder - número de tasks async ativas
+            counter.add(0, &attrs);
+        }
+    }
+}---------------------------------------------
+./utils/observabilidade/layer_metrics.rs
+use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::KeyValue;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+// Métricas por Camada
+static HANDLER_DURATION: OnceLock<Histogram<f64>> = OnceLock::new();
+static SERVICE_DURATION: OnceLock<Histogram<f64>> = OnceLock::new();
+static REPOSITORY_DURATION: OnceLock<Histogram<f64>> = OnceLock::new();
+
+// Métricas de Timeout
+static TIMEOUT_OPERATIONS: OnceLock<Counter<u64>> = OnceLock::new();
+static CANCELED_OPERATIONS: OnceLock<Counter<u64>> = OnceLock::new();
+
+// Métricas de Performance
+static SLOW_OPERATIONS: OnceLock<Counter<u64>> = OnceLock::new();
+
+// Métricas específicas do handler
+static HANDLER_VALIDATION_ERRORS: OnceLock<Counter<u64>> = OnceLock::new();
+static HANDLER_SERVICE_ERRORS: OnceLock<Counter<u64>> = OnceLock::new();
+static HANDLER_OPERATIONS: OnceLock<Counter<u64>> = OnceLock::new();
+static HANDLER_CRITICAL_OPS: OnceLock<Counter<u64>> = OnceLock::new();
+static HANDLER_NOT_FOUND: OnceLock<Counter<u64>> = OnceLock::new();
+
+// initLayerMetrics inicializa métricas específicas por camada
+pub async fn init_layer_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    let meter = crate::observabilidade::meter();
+
+    // Handler Layer Metrics
+    let handler_duration = meter
+        .f64_histogram("handler_duration_seconds")
+        .with_description("Time spent in handler layer")
+        .with_unit("s")
+        .init();
+
+    // Service Layer Metrics
+    let service_duration = meter
+        .f64_histogram("service_duration_seconds")
+        .with_description("Time spent in service layer")
+        .with_unit("s")
+        .init();
+
+    // Repository Layer Metrics
+    let repository_duration = meter
+        .f64_histogram("repository_duration_seconds")
+        .with_description("Time spent in repository layer")
+        .with_unit("s")
+        .init();
+
+    // Timeout Metrics
+    let timeout_operations = meter
+        .u64_counter("timeout_operations_total")
+        .with_description("Total number of operations that timed out")
+        .with_unit("1")
+        .init();
+
+    let canceled_operations = meter
+        .u64_counter("canceled_operations_total")
+        .with_description("Total number of canceled operations")
+        .with_unit("1")
+        .init();
+
+    // Performance Metrics
+    let slow_operations = meter
+        .u64_counter("slow_operations_total")
+        .with_description("Total number of slow operations (>threshold)")
+        .with_unit("1")
+        .init();
+
+    // Handler specific metrics
+    let handler_validation_errors = meter
+        .u64_counter("handler_validation_errors_total")
+        .with_description("Total number of validation errors in handler")
+        .with_unit("1")
+        .init();
+
+    let handler_service_errors = meter
+        .u64_counter("handler_service_errors_total")
+        .with_description("Total number of service errors in handler")
+        .with_unit("1")
+        .init();
+
+    let handler_operations = meter
+        .u64_counter("handler_operations_total")
+        .with_description("Total number of handler operations")
+        .with_unit("1")
+        .init();
+
+    let handler_critical_ops = meter
+        .u64_counter("handler_critical_operations_total")
+        .with_description("Total number of critical operations (create/update/delete)")
+        .with_unit("1")
+        .init();
+
+    let handler_not_found = meter
+        .u64_counter("handler_not_found_total")
+        .with_description("Total number of not found cases")
+        .with_unit("1")
+        .init();
+
+    // Set all metrics
+    HANDLER_DURATION.set(handler_duration).map_err(|_| "Failed to set handler_duration")?;
+    SERVICE_DURATION.set(service_duration).map_err(|_| "Failed to set service_duration")?;
+    REPOSITORY_DURATION.set(repository_duration).map_err(|_| "Failed to set repository_duration")?;
+    TIMEOUT_OPERATIONS.set(timeout_operations).map_err(|_| "Failed to set timeout_operations")?;
+    CANCELED_OPERATIONS.set(canceled_operations).map_err(|_| "Failed to set canceled_operations")?;
+    SLOW_OPERATIONS.set(slow_operations).map_err(|_| "Failed to set slow_operations")?;
+    HANDLER_VALIDATION_ERRORS.set(handler_validation_errors).map_err(|_| "Failed to set handler_validation_errors")?;
+    HANDLER_SERVICE_ERRORS.set(handler_service_errors).map_err(|_| "Failed to set handler_service_errors")?;
+    HANDLER_OPERATIONS.set(handler_operations).map_err(|_| "Failed to set handler_operations")?;
+    HANDLER_CRITICAL_OPS.set(handler_critical_ops).map_err(|_| "Failed to set handler_critical_ops")?;
+    HANDLER_NOT_FOUND.set(handler_not_found).map_err(|_| "Failed to set handler_not_found")?;
+
+    Ok(())
+}
+
+// LayerTiming estrutura para medir tempo por camada
+pub struct LayerTiming {
+    usecase: String,
+    operation: String,
+    layer: String,
+    start: Instant,
+}
+
+impl LayerTiming {
+    // NewLayerTiming cria um novo timer para uma camada
+    pub fn new(usecase: &str, operation: &str, layer: &str) -> Self {
+        Self {
+            usecase: usecase.to_string(),
+            operation: operation.to_string(),
+            layer: layer.to_string(),
+            start: Instant::now(),
+        }
+    }
+
+    // Finish finaliza o timing e registra a métrica
+    pub fn finish(self, error: Option<&anyhow::Error>) {
+        let duration = self.start.elapsed();
+
+        let attrs = vec![
+            KeyValue::new("usecase", self.usecase.clone()),
+            KeyValue::new("operation", self.operation.clone()),
+            KeyValue::new("layer", self.layer.clone()),
+            KeyValue::new("success", error.is_none()),
+        ];
+
+        // Registrar duração baseada na camada
+        match self.layer.as_str() {
+            "handler" => {
+                if let Some(histogram) = HANDLER_DURATION.get() {
+                    histogram.record(duration.as_secs_f64(), &attrs);
+                }
+            }
+            "service" => {
+                if let Some(histogram) = SERVICE_DURATION.get() {
+                    histogram.record(duration.as_secs_f64(), &attrs);
+                }
+            }
+            "repository" => {
+                if let Some(histogram) = REPOSITORY_DURATION.get() {
+                    histogram.record(duration.as_secs_f64(), &attrs);
+                }
+            }
+            _ => {}
+        }
+
+        // Detectar operações lentas (>1s para handler, >500ms para service, >200ms para repository)
+        let threshold = match self.layer.as_str() {
+            "handler" => Duration::from_secs(1),
+            "service" => Duration::from_millis(500),
+            "repository" => Duration::from_millis(200),
+            _ => Duration::from_secs(1),
+        };
+
+        if duration > threshold {
+            if let Some(counter) = SLOW_OPERATIONS.get() {
+                counter.add(1, &attrs);
+            }
+        }
+    }
+}
+
+// TimeoutDetector estrutura para detectar timeouts
+pub struct TimeoutDetector {
+    usecase: String,
+    operation: String,
+    start: Instant,
+}
+
+impl TimeoutDetector {
+    // NewTimeoutDetector cria um novo detector de timeout
+    pub fn new(usecase: &str, operation: &str) -> Self {
+        Self {
+            usecase: usecase.to_string(),
+            operation: operation.to_string(),
+            start: Instant::now(),
+        }
+    }
+
+    // CheckTimeout verifica se houve timeout
+    pub fn check_timeout(&self, is_timeout: bool, is_canceled: bool) {
+        let attrs = vec![
+            KeyValue::new("usecase", self.usecase.clone()),
+            KeyValue::new("operation", self.operation.clone()),
+        ];
+
+        if is_timeout {
+            if let Some(counter) = TIMEOUT_OPERATIONS.get() {
+                counter.add(1, &attrs);
+            }
+        } else if is_canceled {
+            if let Some(counter) = CANCELED_OPERATIONS.get() {
+                counter.add(1, &attrs);
+            }
+        }
+    }
+}---------------------------------------------
+./utils/observabilidade/middleware.rs
+use axum::{
+    extract::Request,
+    middleware::Next,
+    response::Response,
+};
+use std::time::{Duration, Instant};
+
+// HTTPMetricsMiddleware middleware básico para coletar métricas HTTP
+pub fn http_metrics_middleware(usecase: String) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, axum::http::StatusCode>> + Send>> + Clone {
+    move |request: Request, next: Next| {
+        let usecase = usecase.clone();
+        Box::pin(async move {
+            let start = Instant::now();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+
+            // Processar requisição
+            let response = next.run(request).await;
+
+            // Registrar métricas
+            let duration = start.elapsed();
+            let status_code = response.status().as_u16();
+
+            crate::observabilidade::record_http_request(
+                &usecase,
+                &method,
+                &path,
+                duration,
+                status_code,
+            );
+
+            Ok(response)
+        })
+    }
+}
+
+// EnhancedHTTPMetricsMiddleware middleware avançado para métricas HTTP
+pub fn enhanced_http_metrics_middleware(usecase: String) -> impl Fn(Request, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, axum::http::StatusCode>> + Send>> + Clone {
+    move |request: Request, next: Next| {
+        let usecase = usecase.clone();
+        Box::pin(async move {
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+
+            // Timing da camada handler
+            let handler_timing = crate::observabilidade::LayerTiming::new(&usecase, &path, "handler");
+
+            // Detector de timeout
+            let timeout_detector = crate::observabilidade::TimeoutDetector::new(&usecase, &path);
+
+            let start = Instant::now();
+
+            // Processar requisição com timeout de 30 segundos
+            let result = tokio::time::timeout(Duration::from_secs(30), next.run(request)).await;
+
+            let (response, error, is_timeout) = match result {
+                Ok(response) => (response, None, false),
+                Err(_) => {
+                    // Timeout occurred
+                    return Err(axum::http::StatusCode::REQUEST_TIMEOUT);
+                }
+            };
+
+            // Verificar timeout
+            timeout_detector.check_timeout(is_timeout, false);
+
+            // Finalizar timing do handler
+            handler_timing.finish(error.as_ref());
+
+            // Registrar métricas HTTP originais
+            let duration = start.elapsed();
+            let status_code = response.status().as_u16();
+
+            crate::observabilidade::record_http_request(
+                &usecase,
+                &method,
+                &path,
+                duration,
+                status_code,
+            );
+
+            Ok(response)
+        })
+    }
+}---------------------------------------------
+./lib.rs
+// lib.rs - Arquivo principal do módulo
+
+pub mod model;
+pub mod repository;
+pub mod service;
+
+// Re-exports para facilitar o uso
+pub use model::*;
+pub use repository::*;
+pub use service::*;
+
+// src/model.rs
+// Este arquivo contém as estruturas de dados equivalentes ao package model do Go
+
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ItemsPage<T> {
+    pub offset: i64,
+    pub limit: i64,
+    pub total: i64,
+    pub items: T,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Meuexemplo {
+    pub id: i64,
+    pub status_code: String,
+    pub name: String,
+    pub description: String,
+    pub allows_transactions: bool,
+    pub max_transaction_amount: Decimal,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(skip)]
+    #[sqlx(rename = "meuexemplo_category_full_count")]
+    pub full_count: i64,
+}
+
+// src/repository.rs
+// Este arquivo contém o código do repository que já convertemos
+
+pub use crate::meuexemplo_repository_rust::*;
+
+// src/service.rs  
+// Este arquivo contém o código do service que acabamos de converter
+
+pub use crate::meuexemplo_service_rust::*;
+
+// main.rs ou onde você vai usar
+// Exemplo de como usar os módulos
+
+use std::sync::Arc;
+use sqlx::PgPool;
+
+async fn setup_application() -> Result<(), anyhow::Error> {
+    // Setup do banco de dados
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://user:password@localhost/db".to_string());
+    
+    let pool = PgPool::connect(&database_url).await?;
+    let pg_pool = Arc::new(pool);
+
+    // Setup do logger
+    let logger = Box::new(DefaultLogger);
+
+    // Criação do repository
+    let repository = Arc::new(MeuexemploRepository::new(
+        pg_pool.clone(),
+        pg_pool.clone(),
+        logger.clone(),
+    ));
+
+    // Criação do service
+    let service = Resource::new(repository, logger);
+
+    // Exemplo de uso
+    let items_page = service.get_meuexemplo(0, 10).await?;
+    println!("Found {} items", items_page.items.len());
+
+    let meuexemplo = service.get_meuexemplo_by_id(1).await?;
+    if let Some(item) = meuexemplo {
+        println!("Found item: {}", item.name);
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    // Configurar tracing/logging
+    tracing_subscriber::fmt::init();
+
+    // Setup da aplicação
+    setup_application().await?;
+
+    Ok(())
+}

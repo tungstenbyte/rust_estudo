@@ -1,0 +1,105 @@
+# <---- adicionado aqui: Configuração do AlertManager para notificações
+
+global:
+  smtp_smarthost: 'localhost:587'
+  smtp_from: 'alertmanager@palm-pay.com'
+  smtp_auth_username: 'alertmanager@palm-pay.com'
+  smtp_auth_password: 'password'
+
+route:
+  group_by: ['alertname', 'service']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 12h
+  receiver: 'web.hook'
+  routes:
+    # <---- adicionado aqui: Rota para alertas críticos
+    - match:
+        severity: critical
+      receiver: 'critical-alerts'
+      group_wait: 5s
+      repeat_interval: 5m
+
+    # <---- adicionado aqui: Rota para alertas de warning
+    - match:
+        severity: warning
+      receiver: 'warning-alerts'
+      group_wait: 30s
+      repeat_interval: 30m
+
+receivers:
+  # <---- adicionado aqui: Receiver padrão (webhook)
+  - name: 'web.hook'
+    webhook_configs:
+      - url: 'http://127.0.0.1:5001/'
+        send_resolved: true
+
+  # <---- adicionado aqui: Alertas críticos (Slack + Email)
+  - name: 'critical-alerts'
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+        channel: '#palm-pay-alerts'
+        username: 'AlertManager'
+        icon_emoji: ':rotating_light:'
+        title: 'CRÍTICO: {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+        text: |
+          {{ range .Alerts }}
+          *Serviço:* {{ .Labels.service }}
+          *Severidade:* {{ .Labels.severity }}
+          *Descrição:* {{ .Annotations.description }}
+          *Time:* {{ .StartsAt.Format "2006-01-02 15:04:05" }}
+          {{ end }}
+        send_resolved: true
+
+    email_configs:
+      - to: 'devops@palm-pay.com'
+        subject: 'CRÍTICO: {{ .GroupLabels.service }} - {{ .GroupLabels.alertname }}'
+        body: |
+          {{ range .Alerts }}
+          Alerta: {{ .Annotations.summary }}
+          Serviço: {{ .Labels.service }}
+          Severidade: {{ .Labels.severity }}
+          Descrição: {{ .Annotations.description }}
+          
+          Iniciado em: {{ .StartsAt.Format "2006-01-02 15:04:05" }}
+          {{ if .EndsAt }}Resolvido em: {{ .EndsAt.Format "2006-01-02 15:04:05" }}{{ end }}
+          
+          Labels:
+          {{ range .Labels.SortedPairs }}  {{ .Name }}: {{ .Value }}
+          {{ end }}
+          {{ end }}
+
+  # <---- adicionado aqui: Alertas de warning (apenas Slack)
+  - name: 'warning-alerts'
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+        channel: '#palm-pay-monitoring'
+        username: 'AlertManager'
+        icon_emoji: ':warning:'
+        title: 'WARNING: {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+        text: |
+          {{ range .Alerts }}
+          *Serviço:* {{ .Labels.service }}
+          *Descrição:* {{ .Annotations.description }}
+          {{ end }}
+        send_resolved: true
+
+# <---- adicionado aqui: Configuração de inibição (evitar spam de alertas)
+inhibit_rules:
+  # ServiceDown inibe outros alertas do mesmo serviço
+  - source_match:
+      alertname: 'ServiceDown'
+    target_match:
+      service: 'novo-exemplo-palm-pay'
+    equal: ['service']
+
+  # HighErrorRate inibe HighLatency do mesmo endpoint
+  - source_match:
+      alertname: 'HighErrorRate'
+    target_match:
+      alertname: 'HighLatency'
+    equal: ['service', 'endpoint']
+
+# <---- adicionado aqui: Templates customizados (opcional)
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'

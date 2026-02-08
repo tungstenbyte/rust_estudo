@@ -1,0 +1,78 @@
+{
+  "id": null,
+  "title": "Database Analysis - Análise de Banco de Dados",
+  "tags": ["database", "db", "queries"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Queries por Segundo",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "rate(db_queries_ratio_total{usecase=\"meuexemplo\"}[5m])",
+          "legendFormat": "{{operation}} - {{table}}",
+          "refId": "A"
+        }
+      ],
+      "yAxes": [
+        {
+          "label": "Queries/sec",
+          "min": 0
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "title": "Conexões Ativas",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "db_connections_active_ratio{usecase=\"meuexemplo\"}",
+          "legendFormat": "Active Connections",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 50},
+              {"color": "red", "value": 80}
+            ]
+          }
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "id": 3,
+      "title": "Tempo de Query P95 (ms)",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(db_query_duration_seconds_bucket{usecase=\"meuexemplo\"}[5m])) * 1000",
+          "legendFormat": "DB Query P95",
+          "refId": "A"
+        }
+      ],
+      "yAxes": [
+        {
+          "label": "Query Time (ms)",
+          "min": 0
+        }
+      ],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+    }
+  ]
+}

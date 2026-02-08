@@ -1,0 +1,79 @@
+{
+  "id": null,
+  "title": "Error Analysis - Análise de Erros",
+  "tags": ["errors", "troubleshooting", "palmay"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Taxa de Erro Total (%)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "rate(business_operations_ratio_total{success=\"false\"}[5m]) / rate(business_operations_ratio_total[5m]) * 100",
+          "legendFormat": "Error Rate %",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "red", "value": 5}
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "title": "Requests HTTP por Segundo",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "rate(http_requests_ratio_total{usecase=\"meuexemplo\"}[5m])",
+          "legendFormat": "RPS",
+          "refId": "A"
+        }
+      ],
+      "yAxes": [
+        {
+          "label": "Requests/sec",
+          "min": 0
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "id": 3,
+      "title": "Operações de Negócio por Segundo",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "rate(business_operations_ratio_total{usecase=\"meuexemplo\"}[5m])",
+          "legendFormat": "{{operation}}",
+          "refId": "A"
+        }
+      ],
+      "yAxes": [
+        {
+          "label": "Operations/sec",
+          "min": 0
+        }
+      ],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+    }
+  ]
+}
