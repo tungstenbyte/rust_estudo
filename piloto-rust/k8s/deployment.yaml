@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "piloto-rust"
+  labels:
+    app: "piloto-rust"
+spec:
+  selector:
+    matchLabels:
+      app: "piloto-rust"
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: "piloto-rust"
+    spec:
+      containers:
+        - name: "piloto-rust"
+          image: registry.localhost:5000/piloto-rust:v0.01
+          imagePullPolicy: Always
+
+          ports:
+          - containerPort: 8181
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+
