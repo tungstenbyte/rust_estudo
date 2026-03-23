@@ -10,6 +10,7 @@ fn main() {
 
 fn exemplo1() {
     println!("Exemplo1 -------------");
+    println!("Declare a Variable");
     let company_string: &str = "TutorialsPoint"; // string type
     let rating_float: f64 = 4.5; // float type
     let is_growing_boolean: bool = true; // boolean type
@@ -23,6 +24,7 @@ fn exemplo1() {
 
 fn exemplo2() {
     println!("Exemplo2 -------------");
+    println!("Integer");
     let result = 10; // i32 by default
     let age: u32 = 20;
     let sum: i32 = 5 - 15;
@@ -35,6 +37,7 @@ fn exemplo2() {
 
 fn exemplo3() {
     println!("Exemplo3 -------------");
+    println!("Integer Overflow");
     let age: u8 = 255;
 
     // 0 to 255 only allowed for u8
@@ -50,6 +53,7 @@ fn exemplo3() {
 
 fn exemplo4() {
     println!("Exemplo4 -------------");
+    println!("Float");
     let result = 10.00; //f64 by default
     let interest: f32 = 8.35;
     let cost: f64 = 15000.600; //double precision
@@ -60,6 +64,7 @@ fn exemplo4() {
 
 fn exemplo5() {
     println!("Exemplo5 -------------");
+    println!("Number Separator");
     let float_with_separator = 11_000.555_001;
     println!("float value {}", float_with_separator);
     let int_with_separator = 50_000;
@@ -67,15 +72,19 @@ fn exemplo5() {
 }
 
 fn exemplo6() {
+    println!("Exemplo6 -------------");
+    println!("Boolean");
     let isfun: bool = true;
     println!("Is Rust Programming Fun ? {}", isfun);
 }
 
-fn exemplo7(){
+fn exemplo7() {
+    println!("Exemplo7 -------------");
+    println!("Character");
     let special_character = '@'; //default
-let alphabet:char = 'A';
-let emoji:char = '😁';
-println!("special character is {}",special_character);
-println!("alphabet is {}",alphabet);
-println!("emoji is {}",emoji);
+    let alphabet: char = 'A';
+    let emoji: char = '😁';
+    println!("special character is {}", special_character);
+    println!("alphabet is {}", alphabet);
+    println!("emoji is {}", emoji);
 }
