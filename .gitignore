@@ -1,11 +1,27 @@
+# =============================================================
+# rust_estudo — regras globais para todos os crates Cargo
+# piloto-rust, pulsar, capitulo20, tutorialpoint/*, etc.
+# matrix-novo-exemplo-palm-pay.tar.gz permanece versionado
+# =============================================================
+
 # ===============================
-# Rust / Cargo (todos os projetos)
+# Rust / Cargo
 # ===============================
 **/target/
 **/*.rs.bk
 **/*.pdb
 # Cargo.lock: binários → ignore; libs → pode versionar
 **/Cargo.lock
+
+# Binários compilados fora de target/ (ex.: src/main sem .rs)
+**/src/main
+
+# SQLx (cache offline de queries)
+**/.sqlx/
+
+# Profiling / coverage
+*.profraw
+*.profdata
 
 # ===============================
 # Ambiente / segredos
@@ -22,6 +38,7 @@
 !.vscode/tasks.json
 !.vscode/settings.json
 .idea/
+.cursor/
 *.swp
 *.swo
 *~
@@ -33,7 +50,9 @@
 Thumbs.db
 
 # ===============================
-# Logs / temporários
+# Logs / temporários / backups
 # ===============================
 *.log
 *.tmp
+*.orig
+*.bak
